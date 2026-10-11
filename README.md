@@ -1,6 +1,9 @@
 # Edge-Based Vehicle Theft Detection System — LoRa-GSM Hybrid Network
 
-**IPJ527C: Advanced Research Project B — Assignment 1 (Alpha Version Demonstration)**
+**IPJ527C: Advanced Research Project B — Assessment 3 (Beta Version Demonstration)**  
+Melusi Mlungisi Mabaso (221000343) · Supervisor: Dr P. Phoobane · Central University of Technology, Free State
+
+> **Testing without the hardware:** see [Testing the beta without the hardware](#testing-the-beta-without-the-hardware-for-assessors) below. One command runs the real gateway logic and dashboard with a simulated vehicle.
 
 An IoT vehicle theft detection system combining an ESP32-based in-vehicle sensor node, a LoRa telemetry link, a Raspberry Pi 5 edge gateway running machine-learning-based anomaly detection, a SIM800C GSM failover channel for SMS alerts, and a live web dashboard for tracking and history.
 
@@ -96,7 +99,7 @@ The browser opens the dashboard at `http://127.0.0.1:8000`. Keep it beside the c
 
 Before the scenarios, the simulation generates a week of normal history (parked, plus two daily trips) and trains both Isolation Forest models on it, so the alerts come from the trained models rather than the learning-period rule. Timings are shortened for the demo: 30 s SMS cooldown instead of 5 minutes, and a 20 s loss-of-contact timeout instead of 16 minutes. Afterwards, explore every dashboard page: Fleet → Vehicle 1001 (route and history), Alerts, Analytics (packet delivery ratio) and System (gateway/modem/radio health). The simulation uses its own database (`gateway/data/simulation.db`) and never touches real gateway data. Stop it with `Ctrl+C`.
 
-There is no login system in this alpha version — the dashboard is unauthenticated by design, intended for local-network access only during this stage (see Limitations below). No test login details apply.
+There is no login system in this beta version — the dashboard is unauthenticated by design, intended for local-network access only during this stage (see Limitations below). No test login details apply.
 
 ## 4. Requirements checklist (traced to the approved IPJ517C scope)
 
@@ -113,7 +116,7 @@ Full component-by-component traceability, including justification for every hard
 
 **Partially implemented:**
 - Alert delivery channel: SMS only, of the three channels (SMS/app notification/direct call) the proposal names
-- Evaluation metrics: Packet Delivery Ratio is now measured automatically from sequence numbers; alert latency and failover success rate still need a structured field test
+- Evaluation metrics: Packet Delivery Ratio is measured automatically from sequence numbers; alert latency and SMS failover were measured in a field test at the CUT stadium (9 October 2026), with a larger structured test planned
 
 **Deferred (see traceability doc §4 for full reasoning):**
 - Two-colour (authorised vs. deviated) route trail visualisation
@@ -128,13 +131,13 @@ Full component-by-component traceability, including justification for every hard
 - **GPS module is always powered.** The Neo-6M draws roughly 45 mA even while the ESP32 is in deep sleep, which dominates the node's battery budget. A MOSFET power switch or the module's UBX power-save mode would fix this.
 - **No formal range/battery characterisation yet.** The system has been verified working end-to-end on the bench and over short-range testing, but structured range (RSSI/SNR vs. distance) and ESP32 deep-sleep battery-life measurements have not yet been collected.
 - **Isolation Forest tuning is provisional.** The models train on each vehicle's own rolling history (about a week of packets) with 5% contamination, so roughly 5% of normal packets are still scored as outliers by design. They have not yet been evaluated against a substantial real-driving dataset, so false-positive/negative rates are not yet formally characterised.
-- **Dashboard has no authentication.** Acceptable for a local-network alpha demo; would need to be addressed before any real deployment.
+- **Dashboard has no authentication.** Acceptable for a local-network beta demo; would need to be addressed before any real deployment.
 - **Single-vehicle testing to date.** The system supports multiple `node_id`s architecturally (per-node models, per-node database rows), but has only been exercised with one physical mobile node so far.
 
 ## 6. Ethical, privacy and security considerations
 
-- **Location data is sensitive personal data.** The system continuously records a vehicle's (and by extension, its owner's/driver's) real-time and historical location. This alpha version has no data-retention policy or consent flow — for a real deployment, retention limits, owner consent, and access controls on the telemetry database would be required.
-- **Dashboard has no authentication and no transport encryption (HTTP, not HTTPS).** Acceptable only because it is scoped to a trusted local network for this alpha; anyone who can reach the Pi's IP on that network can view live vehicle positions. This must be resolved (auth + TLS) before any deployment outside a controlled demo environment.
+- **Location data is sensitive personal data.** The system continuously records a vehicle's (and by extension, its owner's/driver's) real-time and historical location. This beta version has no data-retention policy or consent flow — for a real deployment, retention limits, owner consent, and access controls on the telemetry database would be required.
+- **Dashboard has no authentication and no transport encryption (HTTP, not HTTPS).** Acceptable only because it is scoped to a trusted local network for this beta; anyone who can reach the Pi's IP on that network can view live vehicle positions. This must be resolved (auth + TLS) before any deployment outside a controlled demo environment.
 - **LoRa telemetry is unencrypted.** A nearby attacker with a compatible SX127x radio could passively intercept location/speed data in transit (confidentiality risk), though spoofing a convincing forged packet would additionally require knowing the exact binary struct layout used. AES-128 on the payload is the planned mitigation (see Next steps).
 - **False positives/negatives in anomaly detection carry real consequences.** An undetected theft (false negative) has an obvious safety/financial impact; an over-eager false positive triggers an unnecessary SMS alert and, in a scaled deployment, alert fatigue. The cold-start fallback and 5% contamination setting are conscious, documented trade-offs, not defaults left unexamined.
 - **SMS alerts include the vehicle's exact coordinates as a Google Maps link.** Phone numbers and message content are handled only in memory/logs on the Pi; no third-party SMS gateway or cloud service is used, which limits (but does not eliminate) third-party data exposure.
@@ -143,7 +146,7 @@ Full component-by-component traceability, including justification for every hard
 
 See `TESTING_EVIDENCE.md` for a structured log of defects found and resolved during development (representative inputs, expected vs. actual results, root cause, and resolution), covering sensor bring-up, LoRa protocol compatibility, GSM connectivity, and deployment/process-conflict issues.
 
-## 8. Next steps (post-alpha)
+## 8. Next steps (post-beta)
 
 1. Full end-to-end live test with the vehicle node physically separated from the gateway at realistic deployment range, capturing alert latency and failover success rate alongside the now-automatic Packet Delivery Ratio — the metrics specified in the approved scope's evaluation plan.
 2. Structured LoRa range/RSSI/SNR logging and ESP32 battery-life measurement.
