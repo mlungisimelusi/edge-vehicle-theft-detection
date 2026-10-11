@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Live Map{% endblock %}
+{% block head_extra %}
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<style>#page-body { padding: 0; }</style>
+{% endblock %}
+{% block content %}
+<div id="map-page-body">
+  <div id="map-sidebar">
+    <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.6px;color:var(--muted);font-weight:600;padding:4px 6px 12px;">Fleet</div>
+    <div id="vehicle-list">
+      <div class="empty-hint" id="empty-hint">Waiting for telemetry from any vehicle node…</div>
+    </div>
+  </div>
+  <div id="map-container">
+    <div id="map"></div>
+    <button id="recenter-btn">
+      <svg viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 0 4 4 4 4 0 0 0-4-4zm9-1h-2.06A7 7 0 0 0 13 1.06V-1h-2v2.06A7 7 0 0 0 5.06 7H3v2h2.06A7 7 0 0 0 11 15.94V18h2v-2.06A7 7 0 0 0 18.94 9H21zm-9 8a5 5 0 1 1 5-5 5 5 0 0 1-5 5z" transform="translate(0,1)"/></svg>
+      Follow vehicle
+    </button>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="/static/js/live_map.js?v={{ asset_v }}"></script>
+{% endblock %}

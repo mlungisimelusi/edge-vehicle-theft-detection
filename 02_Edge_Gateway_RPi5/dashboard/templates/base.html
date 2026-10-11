@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{% block title %}Sentinel{% endblock %} — Vehicle Theft Detection</title>
+<link rel="stylesheet" href="/static/css/style.css?v={{ asset_v }}">
+{% block head_extra %}{% endblock %}
+</head>
+<body>
+<div id="app-shell">
+  <header id="topnav">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 24 24"><path d="M12 1 3 5v6c0 5.5 3.8 10.7 9 12 5.2-1.3 9-6.5 9-12V5l-9-4zm0 10.9h7c-.5 4-3.2 7.5-7 8.9V12H5V6.3l7-3.1v8.7z"/></svg>
+      </div>
+      <div class="brand-text">
+        <h1>Sentinel</h1>
+        <span>Vehicle Theft Detection</span>
+      </div>
+    </div>
+    <nav id="primary-nav">
+      {% for key, href, label in nav_items %}
+      <a href="{{ href }}" class="{{ 'active' if active == key else '' }}">{{ label }}</a>
+      {% endfor %}
+    </nav>
+    <div id="conn-wrap">
+      <span id="conn-dot"></span>
+      <span id="conn-status">connecting…</span>
+    </div>
+  </header>
+  <div id="page-body">
+    {% block content %}{% endblock %}
+  </div>
+</div>
+<script src="/static/js/common.js?v={{ asset_v }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

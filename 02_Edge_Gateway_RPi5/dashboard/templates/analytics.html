@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Analytics{% endblock %}
+{% block head_extra %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.0/chart.umd.min.js"></script>
+{% endblock %}
+{% block content %}
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h2>Fleet Analytics</h2>
+      <p>Aggregate speed, distance and anomaly trends across every vehicle.</p>
+    </div>
+    <div class="btn-row">
+      <button class="btn" data-hours="1">1h</button>
+      <button class="btn active" data-hours="24">24h</button>
+      <button class="btn" data-hours="168">7d</button>
+    </div>
+  </div>
+
+  <div class="grid grid-cols-4" style="margin-bottom:16px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
+    <div class="card stat-card"><div class="label">Vehicles reporting</div><div class="value" id="an-vehicle-count">—</div></div>
+    <div class="card stat-card"><div class="label">Packets received</div><div class="value" id="an-packet-count">—</div></div>
+    <div class="card stat-card"><div class="label">Packet delivery ratio</div><div class="value" id="an-pdr">—</div><div class="sub" id="an-pdr-sub">from node sequence numbers</div></div>
+    <div class="card stat-card"><div class="label">Distance covered</div><div class="value" id="an-distance">—</div><div class="sub">approximate, from valid GPS fixes</div></div>
+    <div class="card stat-card"><div class="label">Anomalies flagged</div><div class="value" id="an-anomaly-count">—</div></div>
+  </div>
+
+  <div class="grid grid-cols-2" style="margin-bottom:16px;">
+    <div class="card card-pad chart-box"><h4><span class="dot" style="background:var(--accent)"></span>Average moving speed per vehicle (km/h)</h4><canvas id="speedBarChart"></canvas></div>
+    <div class="card card-pad chart-box"><h4><span class="dot" style="background:var(--accent-2)"></span>Distance per vehicle (km)</h4><canvas id="distanceBarChart"></canvas></div>
+  </div>
+
+  <div class="card">
+    <table class="data-table">
+      <thead>
+        <tr><th>Vehicle</th><th>Packets</th><th>Avg moving speed</th><th>Max speed</th><th>Distance</th><th>Anomalies</th><th>Avg signal</th><th>PDR</th></tr>
+      </thead>
+      <tbody id="an-tbody"></tbody>
+    </table>
+    <div class="empty-hint" id="an-empty" style="display:none;">No telemetry in this window yet.</div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="/static/js/analytics.js?v={{ asset_v }}"></script>
+{% endblock %}

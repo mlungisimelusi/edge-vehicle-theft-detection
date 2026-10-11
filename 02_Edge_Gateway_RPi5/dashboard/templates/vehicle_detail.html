@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Vehicle {{ node_id }}{% endblock %}
+{% block head_extra %}
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.0/chart.umd.min.js"></script>
+{% endblock %}
+{% block content %}
+<div class="page">
+  <div class="detail-header">
+    <a href="/fleet" class="back-link">&larr; Fleet</a>
+    <h2 style="margin:0;">Vehicle {{ node_id }}</h2>
+    <span class="badge" id="vd-status-badge">—</span>
+  </div>
+
+  <div class="card card-pad" id="vd-nodata" style="display:none;margin-bottom:16px;">
+    <div class="empty-hint" style="padding:6px 0;">Vehicle {{ node_id }} hasn't sent any telemetry to this gateway yet.</div>
+  </div>
+
+  <div class="grid grid-cols-4" style="margin-bottom:16px;">
+    <div class="card stat-card"><div class="label">Speed</div><div class="value" id="vd-speed">—</div></div>
+    <div class="card stat-card"><div class="label">Battery</div><div class="value" id="vd-battery">—</div></div>
+    <div class="card stat-card"><div class="label">Satellites</div><div class="value" id="vd-sats">—</div></div>
+    <div class="card stat-card"><div class="label">Signal (RSSI / SNR)</div><div class="value" id="vd-signal">—</div></div>
+  </div>
+
+  <div class="grid grid-cols-2" style="margin-bottom:16px; align-items: start;">
+    <div class="card card-pad">
+      <h4 style="margin:0 0 10px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;">Last known position &amp; route</h4>
+      <div id="vd-map" style="height:320px;border-radius:10px;overflow:hidden;"></div>
+      <div class="mvc-meta" style="margin-top:10px;" id="vd-position">—</div>
+      <div class="mvc-meta" style="margin-top:4px;">Last packet <span data-ts="" id="vd-lastseen">—</span>
+        &middot; <a id="vd-maplink" href="#" target="_blank" rel="noopener" style="color:var(--accent-2);display:none;">open in Google Maps &rarr;</a></div>
+      <div class="mvc-meta" style="margin-top:4px;" id="vd-route-note"></div>
+    </div>
+    <div class="card card-pad">
+      <h4 style="margin:0 0 10px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;">Alert history for this vehicle</h4>
+      <div id="vd-alerts"><div class="empty-hint">No alerts recorded for this vehicle yet.</div></div>
+    </div>
+  </div>
+
+  <div class="card card-pad">
+    <div class="btn-row" style="margin-bottom:14px;">
+      <span style="font-size:13px;font-weight:600;margin-right:auto;">History</span>
+      <button class="btn" data-hours="1">1h</button>
+      <button class="btn active" data-hours="24">24h</button>
+      <button class="btn" data-hours="168">7d</button>
+    </div>
+    <div class="grid grid-cols-2">
+      <div class="chart-box"><h4><span class="dot" style="background:var(--accent)"></span>Speed (km/h, from GPS fixes)</h4><canvas id="speedChart" height="90"></canvas></div>
+      <div class="chart-box"><h4><span class="dot" style="background:var(--ok)"></span>Battery (V)</h4><canvas id="batteryChart" height="90"></canvas></div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>const NODE_ID = {{ node_id }};</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="/static/js/vehicle_detail.js?v={{ asset_v }}"></script>
+{% endblock %}

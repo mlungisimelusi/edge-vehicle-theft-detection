@@ -1,0 +1,18 @@
+<!--
+  DEPRECATED — superseded by the multi-page dashboard.
+
+  The dashboard is no longer a single HTML file. It is now server-rendered
+  with FastAPI + Jinja2 across several real pages:
+
+    dashboard/templates/base.html            shared layout + nav
+    dashboard/templates/live_map.html        "/"          Live Map
+    dashboard/templates/fleet.html           "/fleet"     Fleet list
+    dashboard/templates/vehicle_detail.html  "/fleet/{id}" Vehicle detail
+    dashboard/templates/alerts.html          "/alerts"    Alert/incident log
+    dashboard/templates/analytics.html       "/analytics" Fleet analytics
+    dashboard/templates/system.html          "/system"    System status
+
+  Shared CSS/JS live under dashboard/static/css/ and dashboard/static/js/.
+  See server.py — no route serves this file anymore; it is kept only so
+  nothing under static/ silently disappears from the project history.
+-->

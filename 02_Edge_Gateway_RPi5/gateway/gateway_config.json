@@ -1,0 +1,7 @@
+{
+  "alert_phone_numbers": [],
+  "gsm_serial_port": "/dev/ttyAMA0",
+  "contact_timeout_minutes": 16,
+  "loss_of_contact_alerts": true,
+  "known_node_ids": [1001]
+}

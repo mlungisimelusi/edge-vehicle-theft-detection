@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Alerts{% endblock %}
+{% block content %}
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h2>Alert &amp; Incident Log</h2>
+      <p>Every confirmed anomaly the edge gateway has dispatched an SMS for.</p>
+    </div>
+    <select id="alert-node-filter" class="search-input" style="width:200px;">
+      <option value="">All vehicles</option>
+    </select>
+  </div>
+  <div class="card card-pad">
+    <div id="alerts-list"><div class="empty-hint">Loading…</div></div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="/static/js/alerts.js?v={{ asset_v }}"></script>
+{% endblock %}

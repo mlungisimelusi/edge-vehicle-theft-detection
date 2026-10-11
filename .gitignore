@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Runtime data (real telemetry/location history and simulation output)
+02_Edge_Gateway_RPi5/gateway/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Presentation and video material (submitted separately)
+Beta_Demo/
+*.pptx
+*.mp4
+
+# Editor / OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

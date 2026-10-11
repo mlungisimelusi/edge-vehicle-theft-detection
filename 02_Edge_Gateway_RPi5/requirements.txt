@@ -1,0 +1,6 @@
+spidev>=3.6
+gpiozero>=2.0
+lgpio>=0.2.2.0
+pyserial>=3.5
+numpy>=1.26
+scikit-learn>=1.4

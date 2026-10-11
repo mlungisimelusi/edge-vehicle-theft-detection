@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}System{% endblock %}
+{% block content %}
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h2>System Status</h2>
+      <p>Health of the edge gateway pipeline this dashboard reads from.</p>
+    </div>
+  </div>
+
+  <div class="grid grid-cols-4" style="margin-bottom:16px;">
+    <div class="card stat-card">
+      <div class="label">Gateway process</div>
+      <div class="value" id="sys-gw-status"><span class="status-dot muted"></span></div>
+      <div class="sub" id="sys-gw-sub">—</div>
+    </div>
+    <div class="card stat-card">
+      <div class="label">SMS alerts (SIM800C)</div>
+      <div class="value" id="sys-gsm-status"><span class="status-dot muted"></span></div>
+      <div class="sub" id="sys-gsm-sub">—</div>
+    </div>
+    <div class="card stat-card">
+      <div class="label">Alerts awaiting SMS</div>
+      <div class="value" id="sys-pending">—</div>
+      <div class="sub" id="sys-pending-sub">queued while the modem is unavailable</div>
+    </div>
+    <div class="card stat-card">
+      <div class="label">LoRa radio</div>
+      <div class="value" id="sys-lora-packets">—</div>
+      <div class="sub" id="sys-lora-crc">packets received since gateway start</div>
+    </div>
+  </div>
+
+  <div class="grid grid-cols-4" style="margin-bottom:16px;">
+    <div class="card stat-card">
+      <div class="label">LoRa link</div>
+      <div class="value" id="sys-lora-status"><span class="status-dot muted"></span></div>
+      <div class="sub" id="sys-lora-sub">—</div>
+    </div>
+    <div class="card stat-card"><div class="label">Known vehicles</div><div class="value" id="sys-vehicle-count">—</div></div>
+    <div class="card stat-card"><div class="label">Dashboard clients connected</div><div class="value" id="sys-clients">—</div></div>
+    <div class="card stat-card"><div class="label">Dashboard uptime</div><div class="value" id="sys-uptime">—</div></div>
+  </div>
+
+  <div class="grid grid-cols-2">
+    <div class="card card-pad">
+      <h4 style="margin:0 0 8px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;">Database</h4>
+      <div class="kv-list">
+        <div class="kv-row"><span class="k">Telemetry rows</span><span class="v" id="sys-telemetry-count">—</span></div>
+        <div class="kv-row"><span class="k">Alert rows</span><span class="v" id="sys-alert-count">—</span></div>
+        <div class="kv-row"><span class="k">Database size</span><span class="v" id="sys-db-size">—</span></div>
+        <div class="kv-row"><span class="k">Database path</span><span class="v" id="sys-db-path" style="font-size:11px;color:var(--muted);text-align:right;max-width:60%;word-break:break-all;">—</span></div>
+        <div class="kv-row"><span class="k">Live-poll interval</span><span class="v" id="sys-poll-interval">—</span></div>
+      </div>
+    </div>
+    <div class="card card-pad">
+      <h4 style="margin:0 0 8px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;">Most recent alert</h4>
+      <div id="sys-last-alert"><div class="empty-hint">No alerts recorded yet.</div></div>
+    </div>
+  </div>
+
+  <div class="card card-pad" style="margin-top:16px;">
+    <h4 style="margin:0 0 8px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;">Communication design</h4>
+    <p style="color:var(--muted);font-size:13px;line-height:1.6;margin:0;">
+      LoRa is the primary channel for all routine telemetry between the mobile node and this gateway.
+      The GSM module (SIM800C) stays registered on the network but transmits only when an alert must go
+      out: a theft alert from the Isolation Forest model, a follow-up location update, or a loss-of-contact
+      alert when a vehicle stops reporting — never for routine telemetry. This dashboard reads the shared
+      SQLite database the gateway writes to, including a status heartbeat the gateway updates every few
+      seconds. It never talks to the LoRa or GSM hardware directly, so restarting the dashboard never
+      affects detection or alerting.
+    </p>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="/static/js/system.js?v={{ asset_v }}"></script>
+{% endblock %}

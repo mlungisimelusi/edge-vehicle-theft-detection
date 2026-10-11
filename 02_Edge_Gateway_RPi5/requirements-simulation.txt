@@ -1,0 +1,10 @@
+# Hardware-free simulation (any PC: Windows, macOS, Linux). Python 3.10+.
+#   pip install -r requirements-simulation.txt
+#   cd gateway
+#   python simulate.py
+numpy>=1.26
+scikit-learn>=1.4
+pyserial>=3.5
+fastapi>=0.110
+uvicorn[standard]>=0.29
+jinja2>=3.1

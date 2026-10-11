@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Fleet{% endblock %}
+{% block content %}
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h2>Fleet</h2>
+      <p>Every vehicle node the gateway has ever heard from, live.</p>
+    </div>
+    <input type="text" id="fleet-search" class="search-input" placeholder="Search by vehicle ID…">
+  </div>
+  <div class="card">
+    <table class="data-table" id="fleet-table">
+      <thead>
+        <tr>
+          <th>Vehicle</th><th>Status</th><th>Speed</th><th>Battery</th>
+          <th>Satellites</th><th>Signal</th><th>Last GPS fix</th><th>Last packet</th>
+        </tr>
+      </thead>
+      <tbody id="fleet-tbody"></tbody>
+    </table>
+    <div class="empty-hint" id="fleet-empty" style="display:none;">No vehicles have reported in yet.</div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="/static/js/fleet.js?v={{ asset_v }}"></script>
+{% endblock %}
