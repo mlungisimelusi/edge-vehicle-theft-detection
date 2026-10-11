@@ -3,9 +3,33 @@
 **IPJ527C: Advanced Research Project B — Assessment 3 (Beta Version Demonstration)**  
 Melusi Mlungisi Mabaso (221000343) · Supervisor: Dr P. Phoobane · Central University of Technology, Free State
 
-> **Testing without the hardware:** see [Testing the beta without the hardware](#testing-the-beta-without-the-hardware-for-assessors) below. One command runs the real gateway logic and dashboard with a simulated vehicle.
-
 An IoT vehicle theft detection system combining an ESP32-based in-vehicle sensor node, a LoRa telemetry link, a Raspberry Pi 5 edge gateway running machine-learning-based anomaly detection, a SIM800C GSM failover channel for SMS alerts, and a live web dashboard for tracking and history.
+
+## Testing the beta without the hardware (for assessors)
+
+The physical system needs the ESP32 node, LoRa radios, a Raspberry Pi 5 and a SIM800C. To let anyone test it on an ordinary PC (Windows, macOS or Linux, Python 3.10+), `gateway/simulate.py` runs the **real gateway code and the real dashboard**. Only the vehicle node, the radio and the modem are simulated: packets are generated in the exact binary format the ESP32 sends, and SMS messages are printed to the console instead of being sent.
+
+Download the code (green **Code** button → **Download ZIP**, then extract it, or `git clone` the repository), open a terminal in the extracted folder, and run:
+
+```bash
+cd 02_Edge_Gateway_RPi5
+python -m venv venv
+venv\Scripts\activate            # Windows   (macOS/Linux: source venv/bin/activate)
+pip install -r requirements-simulation.txt
+cd gateway
+python simulate.py
+```
+
+The browser opens the dashboard at `http://127.0.0.1:8000`. Keep it beside the console window. Over about 3 minutes, four scenarios play out:
+
+| Scenario | What happens | What you should see |
+|---|---|---|
+| A. Parked | Routine heartbeats | Logged as "judged normal", no alert; vehicle green on the Live Map |
+| B. Theft | The vehicle is moved at an hour it is never normally used, then driven away fast | **THEFT ALERT** SMS in the console; **LOCATION UPDATE** SMS once GPS has a fix; vehicle turns red; route drawn on the map; repeat alert after the (shortened) cooldown |
+| C. Out of range | Packets stop | **CONTACT LOST** SMS with the last known position |
+| D. Back in range | The node reports again | "contact restored"; the vehicle stays red because of the recent theft alert |
+
+Before the scenarios, the simulation generates a week of normal history (parked, plus two daily trips) and trains both Isolation Forest models on it, so the alerts come from the trained models rather than the learning-period rule. Timings are shortened for the demo: 30 s SMS cooldown instead of 5 minutes, and a 20 s loss-of-contact timeout instead of 16 minutes. Afterwards, explore every dashboard page: Fleet → Vehicle 1001 (route and history), Alerts, Analytics (packet delivery ratio) and System (gateway/modem/radio health). The simulation uses its own database (`gateway/data/simulation.db`) and never touches real gateway data. Stop it with `Ctrl+C`.
 
 ---
 
@@ -74,30 +98,6 @@ source venv/bin/activate
 uvicorn server:app --host 0.0.0.0 --port 8000
 # then browse to http://<pi-ip-address>:8000/ from any device on the same network
 ```
-
-### Testing the beta without the hardware (for assessors)
-
-The physical system needs the ESP32 node, LoRa radios, a Raspberry Pi 5 and a SIM800C. To let anyone test it on an ordinary PC (Windows, macOS or Linux, Python 3.10+), `gateway/simulate.py` runs the **real gateway code and the real dashboard**. Only the vehicle node, the radio and the modem are simulated: packets are generated in the exact binary format the ESP32 sends, and SMS messages are printed to the console instead of being sent.
-
-```bash
-cd 02_Edge_Gateway_RPi5
-python -m venv venv
-venv\Scripts\activate            # Windows   (macOS/Linux: source venv/bin/activate)
-pip install -r requirements-simulation.txt
-cd gateway
-python simulate.py
-```
-
-The browser opens the dashboard at `http://127.0.0.1:8000`. Keep it beside the console window. Over about 3 minutes, four scenarios play out:
-
-| Scenario | What happens | What you should see |
-|---|---|---|
-| A. Parked | Routine heartbeats | Logged as "judged normal", no alert; vehicle green on the Live Map |
-| B. Theft | The vehicle is moved at an hour it is never normally used, then driven away fast | **THEFT ALERT** SMS in the console; **LOCATION UPDATE** SMS once GPS has a fix; vehicle turns red; route drawn on the map; repeat alert after the (shortened) cooldown |
-| C. Out of range | Packets stop | **CONTACT LOST** SMS with the last known position |
-| D. Back in range | The node reports again | "contact restored"; the vehicle stays red because of the recent theft alert |
-
-Before the scenarios, the simulation generates a week of normal history (parked, plus two daily trips) and trains both Isolation Forest models on it, so the alerts come from the trained models rather than the learning-period rule. Timings are shortened for the demo: 30 s SMS cooldown instead of 5 minutes, and a 20 s loss-of-contact timeout instead of 16 minutes. Afterwards, explore every dashboard page: Fleet → Vehicle 1001 (route and history), Alerts, Analytics (packet delivery ratio) and System (gateway/modem/radio health). The simulation uses its own database (`gateway/data/simulation.db`) and never touches real gateway data. Stop it with `Ctrl+C`.
 
 There is no login system in this beta version — the dashboard is unauthenticated by design, intended for local-network access only during this stage (see Limitations below). No test login details apply.
 
