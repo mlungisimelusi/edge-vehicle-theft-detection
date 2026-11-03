@@ -42,7 +42,12 @@
  *
  *  Board: ESP32 Dev Module (Arduino-ESP32 core)
  *
- *  Wake flow (v2):
+ *  Security (packet v3): every packet is encrypted and authenticated with
+ *  AES-128-GCM (aes_gcm_lite.h, self-contained in this sketch folder) using the key in
+ *  lora_key.h. The gateway rejects forged, altered and replayed packets.
+ *  Transmit power is 10 dBm (ICASA's 10 mW limit for this 433 MHz band).
+ *
+ *  Wake flow:
  *    MOTION wake : init MPU + LoRa -> send an IMMEDIATE "motion" packet with
  *                  the last cached position (so the gateway can alert within
  *                  ~1 s instead of waiting up to 45 s for GPS) -> acquire GPS
@@ -51,10 +56,10 @@
  *    Both        : put the SX1278 into LoRa sleep before ESP32 deep sleep (in
  *                  standby it would keep drawing ~1.6 mA the whole time).
  *
- *  Every packet carries a protocol version, a packet type and a sequence
- *  number kept in RTC memory. The gateway uses the sequence number to drop
- *  duplicates, flag sequence resets/replays, and compute Packet Delivery
- *  Ratio (PDR) from the gaps.
+ *  Every packet carries a protocol version, a packet type, a boot epoch
+ *  (flash, increments each power-on) and a sequence number (RTC memory).
+ *  Together they form the unique AES-GCM nonce; the gateway also uses them
+ *  to reject replays and to compute Packet Delivery Ratio (PDR) from gaps.
  *
  *  Reliability notes:
  *    - MPU6050 bring-up is retried (MPU_INIT_RETRIES attempts). If the sensor
@@ -73,6 +78,17 @@
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
 #include "esp_sleep.h"
+#include <Preferences.h>      // NVS flash: persistent boot epoch for the AES-GCM nonce
+#include "aes_gcm_lite.h"     // self-contained AES-128-GCM (no mbedtls dependency)
+
+// The AES-128 key shared with the gateway. Generate it (and the gateway's
+// matching secrets.json) with:  python 02_Edge_Gateway_RPi5/gateway/generate_secrets.py
+// lora_key.h is listed in .gitignore — never commit or share it.
+#if __has_include("lora_key.h")
+#include "lora_key.h"
+#else
+#error "lora_key.h is missing: run 02_Edge_Gateway_RPi5/gateway/generate_secrets.py to create it (and the gateway's secrets.json), then compile again."
+#endif
 
 // This firmware targets the classic ESP32 (ESP32-WROOM / DevKit): the pin
 // map (GPIO16/17/21/22/23/26/27/34) and the EXT0 motion wake-up only exist
@@ -175,7 +191,11 @@
 // Radio / node configuration
 // ---------------------------------------------------------------------------
 #define LORA_FREQUENCY      433E6   // SX1278 433 MHz variant — South Africa ICASA SRD band
-#define LORA_TX_POWER_DBM   14      // Conservative default — adjust to local regs
+// ICASA's licence-exempt 433.05-434.79 MHz short-range-device allocation
+// allows 10 mW e.r.p. (10 dBm). The spring antennas used here have roughly
+// 0 dBi gain or less, so 10 dBm at the module keeps the radiated power within
+// that limit.
+#define LORA_TX_POWER_DBM   10
 #define LORA_SPREADING_FACTOR 9
 #define LORA_SIGNAL_BANDWIDTH  125E3
 #define LORA_CODING_RATE4   5
@@ -229,10 +249,16 @@
 #define MPU_SELFTEST_WINDOW_MS     15000UL
 
 // ---------------------------------------------------------------------------
-// Telemetry packet v2 — fixed-size binary layout shared with the RPi5 gateway
-// (pi_gateway.py TELEMETRY_V2_FORMAT = "<BBIIffffBBBH", 31 bytes).
+// Telemetry packet v3 — AES-128-GCM encrypted and authenticated (51 bytes),
+// byte-for-byte matching the gateway's lora_crypto.py:
+//   header  (14 B, clear, authenticated)  version, type, nodeId, bootEpoch, sequence
+//   body    (21 B, encrypted)             lat, lon, speed, heading, sats, motion, gpsValid, batt
+//   tag     (16 B)                        GCM authentication tag
+// Nonce (12 B) = nodeId | bootEpoch | sequence — unique for every packet:
+// the sequence never repeats within a boot, and the boot epoch is kept in
+// flash (NVS) and incremented on every power-on, so it never repeats either.
 // ---------------------------------------------------------------------------
-#define PACKET_PROTOCOL_VERSION   2
+#define PACKET_PROTOCOL_VERSION   3
 
 #define PACKET_TYPE_HEARTBEAT       0   // periodic timer wake
 #define PACKET_TYPE_MOTION_ALERT    1   // sent immediately on motion wake, BEFORE GPS
@@ -242,7 +268,11 @@ typedef struct __attribute__((packed)) {
   uint8_t  protocolVersion; // PACKET_PROTOCOL_VERSION
   uint8_t  packetType;      // PACKET_TYPE_*
   uint32_t nodeId;
-  uint32_t sequence;        // increments on every transmission (RTC memory)
+  uint32_t bootEpoch;       // increments on every power-on (NVS flash)
+  uint32_t sequence;        // increments on every transmission, restarts each boot
+} PacketHeader;
+
+typedef struct __attribute__((packed)) {
   float    latitude;
   float    longitude;
   float    speedKmph;
@@ -251,9 +281,11 @@ typedef struct __attribute__((packed)) {
   uint8_t  motionFlag;      // 1 = this wake was caused by the motion interrupt
   uint8_t  gpsValid;        // 1 = fresh fix this cycle, 0 = stale/cached fix
   uint16_t batteryMilliVolts;
-} TelemetryPacket;
+} PacketBody;
 
-static_assert(sizeof(TelemetryPacket) == 31, "TelemetryPacket must be 31 bytes to match the gateway");
+#define GCM_TAG_SIZE 16
+static_assert(sizeof(PacketHeader) == 14, "PacketHeader must be 14 bytes to match the gateway");
+static_assert(sizeof(PacketBody) == 21, "PacketBody must be 21 bytes to match the gateway");
 
 // ---------------------------------------------------------------------------
 // State persisted across deep-sleep cycles (RTC memory). Survives deep sleep,
@@ -266,6 +298,7 @@ RTC_DATA_ATTR uint8_t  lastSats = 0;
 RTC_DATA_ATTR bool     hasEverFixed = false;
 RTC_DATA_ATTR uint32_t bootCount = 0;
 RTC_DATA_ATTR uint32_t packetSequence = 0;
+RTC_DATA_ATTR uint32_t bootEpoch = 0;     // copy of the NVS value, valid across deep sleep
 
 TinyGPSPlus gps;
 HardwareSerial GPSSerial(2); // UART2
@@ -290,6 +323,7 @@ bool     acquireGpsFix(unsigned long timeoutMs);
 uint16_t readBatteryMilliVolts();
 bool     initializeLoraWithRetries();
 void     sendTelemetry(uint8_t packetType, bool motionTriggered, bool gpsFixValid);
+void     updateBootEpoch(esp_sleep_wakeup_cause_t wakeCause);
 void     goToDeepSleep(bool armMotionWake);
 const char *wakeReasonToString(esp_sleep_wakeup_cause_t cause);
 
@@ -303,6 +337,7 @@ void setup() {
 
   Serial.println();
   Serial.printf("[BOOT #%lu] Wake reason: %s\n", (unsigned long)bootCount, wakeReasonToString(wakeCause));
+  updateBootEpoch(wakeCause);
 
   // --- I2C bus ---
   if (!Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN)) {
@@ -729,31 +764,70 @@ bool initializeLoraWithRetries() {
 void sendTelemetry(uint8_t packetType, bool motionTriggered, bool gpsFixValid) {
   packetSequence++;
 
-  TelemetryPacket packet;
-  packet.protocolVersion  = PACKET_PROTOCOL_VERSION;
-  packet.packetType       = packetType;
-  packet.nodeId           = NODE_ID;
-  packet.sequence         = packetSequence;
-  packet.latitude         = hasEverFixed ? lastLat : 0.0f;
-  packet.longitude        = hasEverFixed ? lastLng : 0.0f;
+  PacketHeader header;
+  header.protocolVersion = PACKET_PROTOCOL_VERSION;
+  header.packetType      = packetType;
+  header.nodeId          = NODE_ID;
+  header.bootEpoch       = bootEpoch;
+  header.sequence        = packetSequence;
+
+  PacketBody body;
+  body.latitude          = hasEverFixed ? lastLat : 0.0f;
+  body.longitude         = hasEverFixed ? lastLng : 0.0f;
   // Speed/heading only mean something alongside a fresh fix from THIS wake.
-  packet.speedKmph        = (gpsFixValid && gps.speed.isValid()) ? (float)gps.speed.kmph() : 0.0f;
-  packet.headingDeg       = (gpsFixValid && gps.course.isValid()) ? (float)gps.course.deg() : 0.0f;
-  packet.satellites       = lastSats;
-  packet.motionFlag       = motionTriggered ? 1 : 0;
-  packet.gpsValid         = gpsFixValid ? 1 : 0;
-  packet.batteryMilliVolts = readBatteryMilliVolts();
+  body.speedKmph         = (gpsFixValid && gps.speed.isValid()) ? (float)gps.speed.kmph() : 0.0f;
+  body.headingDeg        = (gpsFixValid && gps.course.isValid()) ? (float)gps.course.deg() : 0.0f;
+  body.satellites        = lastSats;
+  body.motionFlag        = motionTriggered ? 1 : 0;
+  body.gpsValid          = gpsFixValid ? 1 : 0;
+  body.batteryMilliVolts = readBatteryMilliVolts();
+
+  // Nonce = nodeId | bootEpoch | sequence (little-endian, as on the gateway).
+  uint8_t nonce[12];
+  memcpy(nonce,     &header.nodeId,    4);
+  memcpy(nonce + 4, &header.bootEpoch, 4);
+  memcpy(nonce + 8, &header.sequence,  4);
+
+  uint8_t ciphertext[sizeof(PacketBody)];
+  uint8_t tag[GCM_TAG_SIZE];
+  aes128_gcm_encrypt(LORA_AES_KEY, nonce,
+                     (const uint8_t *)&header, sizeof(PacketHeader),   // authenticated, not encrypted
+                     (const uint8_t *)&body, sizeof(PacketBody),
+                     ciphertext, tag);
 
   LoRa.beginPacket();
-  LoRa.write((uint8_t *)&packet, sizeof(TelemetryPacket));
+  LoRa.write((const uint8_t *)&header, sizeof(PacketHeader));
+  LoRa.write(ciphertext, sizeof(ciphertext));
+  LoRa.write(tag, sizeof(tag));
   bool sent = LoRa.endPacket();   // blocking; returns once TX is done
 
-  Serial.printf("[LORA] TX %s type=%u seq=%lu node=%lu motion=%u gpsValid=%u lat=%.6f lng=%.6f "
-                "speed=%.1f batt=%umV (%u bytes)\n",
-                sent ? "OK" : "FAILED", packet.packetType, (unsigned long)packet.sequence,
-                (unsigned long)packet.nodeId, packet.motionFlag, packet.gpsValid,
-                packet.latitude, packet.longitude, packet.speedKmph,
-                packet.batteryMilliVolts, (unsigned)sizeof(TelemetryPacket));
+  Serial.printf("[LORA] TX %s (AES-GCM) type=%u epoch=%lu seq=%lu node=%lu motion=%u gpsValid=%u "
+                "lat=%.6f lng=%.6f speed=%.1f batt=%umV (%u bytes)\n",
+                sent ? "OK" : "FAILED", header.packetType, (unsigned long)header.bootEpoch,
+                (unsigned long)header.sequence, (unsigned long)header.nodeId, body.motionFlag,
+                body.gpsValid, body.latitude, body.longitude, body.speedKmph, body.batteryMilliVolts,
+                (unsigned)(sizeof(PacketHeader) + sizeof(PacketBody) + GCM_TAG_SIZE));
+}
+
+// ===========================================================================
+// Boot epoch for the AES-GCM nonce. Deep-sleep wakes keep the RTC copy; any
+// other start (power-on, reset, brown-out) clears RTC memory, so the epoch is
+// read from flash, incremented and written back, and the sequence restarts.
+// Flash is only written on these rare full restarts, never on deep-sleep
+// wakes, so flash wear is negligible.
+// ===========================================================================
+void updateBootEpoch(esp_sleep_wakeup_cause_t wakeCause) {
+  bool deepSleepWake = (wakeCause == ESP_SLEEP_WAKEUP_EXT0 || wakeCause == ESP_SLEEP_WAKEUP_TIMER);
+  if (deepSleepWake && bootEpoch != 0) {
+    return;
+  }
+  Preferences prefs;
+  prefs.begin("vtd", false);
+  bootEpoch = prefs.getUInt("bootEpoch", 0) + 1;
+  prefs.putUInt("bootEpoch", bootEpoch);
+  prefs.end();
+  packetSequence = 0;
+  Serial.printf("[BOOT] New boot epoch %lu (stored in flash).\n", (unsigned long)bootEpoch);
 }
 
 // ===========================================================================

@@ -67,7 +67,7 @@ Every page uses the same vehicle states (defined once in `static/js/common.js`):
 
 | State | Colour | Meaning |
 |---|---|---|
-| **theft alert** | red | The gateway raised a theft alert in the last 30 minutes. It stays red for that long, so a stolen car doesn't turn green again on its next normal-looking packet. |
+| **theft alert** | red | The gateway raised a theft alert in the last 30 minutes and the owner hasn't disarmed since (disarming acknowledges it). It stays red for that long, so a stolen car doesn't turn green again on its next normal-looking packet. |
 | **contact lost** | red | A loss-of-contact alert was raised and the vehicle still hasn't reported. |
 | **no signal** | amber | No packet for 15 minutes. |
 | **gps lost** / **no gps fix** | amber | Packets are arriving, but there's been no fresh GPS fix for 10 minutes (or ever). |
@@ -77,15 +77,15 @@ States are based on alerts, not on each packet's `is_anomaly` flag (with 5% cont
 
 **Live Map** (`/`) — a Leaflet map with a base-map switcher in the top-right corner (Dark, Streets and Satellite; OpenStreetMap and Esri tiles, no API key needed, and your choice is remembered) with a rotating, coloured marker per vehicle and its route over the last 2 hours. A vehicle whose latest packet has no GPS fix (for example the immediate motion packet) stays on the map at its last known position instead of disappearing. A compact sidebar lists every vehicle with its state and a link to its detail page.
 
-**Fleet** (`/fleet`) — every vehicle the gateway has heard from, in a searchable table (state, speed, battery in volts, satellites, signal, last GPS fix, last packet), with vehicles in trouble sorted to the top. Click a row to open the detail page.
+**Fleet** (`/fleet`) — every vehicle the gateway has heard from, in a searchable table (state, ARMED/DISARMED mode, speed, battery in volts, satellites, signal, last GPS fix, last packet), with vehicles in trouble sorted to the top. Click a row to open the detail page.
 
-**Vehicle detail** (`/fleet/{id}`) — one vehicle's current stats, last known position (with its age, coordinates and a Google Maps link), its route over the chosen window, its alert history, and speed/battery charts over 1h/24h/7d. Speed is plotted only from packets with a fresh fix, so stale packets don't draw false "stopped" dips. This is what you'd screenshot for your report's evaluation section — actual collected data, not a mockup.
+**Vehicle detail** (`/fleet/{id}`) — an **Arm / Disarm** button (asks for the PIN from `gateway/secrets.json`; five wrong PINs lock it for a minute), one vehicle's current stats, last known position (with its age, coordinates and a Google Maps link), its route over the chosen window in two colours (**blue** = normal, **red** = recorded after a theft alert, until the owner disarmed or 30 minutes passed), its alert history, and speed/battery charts over 1h/24h/7d. Speed is plotted only from packets with a fresh fix, so stale packets don't draw false "stopped" dips. This is what you'd screenshot for your report's evaluation section — actual collected data, not a mockup.
 
 **Alerts** (`/alerts`) — the full incident log across every vehicle, filterable by vehicle, with readable reasons and a Google Maps link to the last known location. An alert shows "SMS pending" until the gateway confirms the SMS went out, then updates live to "SMS sent".
 
 **Analytics** (`/analytics`) — fleet-wide aggregates over a chosen window: Packet Delivery Ratio, average moving speed, peak speed, approximate distance travelled (ignoring GPS jitter while parked), and anomaly counts per vehicle, as both charts and a table.
 
-**System** (`/system`) — whether the **gateway process** is running (from a heartbeat it writes every 10 seconds), whether **SMS alerts** can be sent (SIM800C ready, alert numbers configured), how many alerts are waiting for SMS, LoRa packets and CRC errors, plus link freshness, database size/row counts and the most recent alert. It's a health check of the whole pipeline without reading gateway logs.
+**System** (`/system`) — **LoRa link security** (AES-128-GCM, and how many forged/replayed/unencrypted packets were rejected), whether the **gateway process** is running (from a heartbeat it writes every 10 seconds), whether **SMS alerts** can be sent (SIM800C ready, alert numbers configured), how many alerts are waiting for SMS, LoRa packets and CRC errors, plus link freshness, database size/row counts and the most recent alert. It's a health check of the whole pipeline without reading gateway logs.
 
 ## 5. Run automatically on boot (optional)
 
@@ -120,6 +120,7 @@ sudo systemctl enable --now vehicle-dashboard.service
 - `MAX_LIVE_TRAIL_POINTS` (in `static/js/live_map.js`) caps how many live points are kept in the browser's in-memory trail before older ones drop off, so a long-running dashboard tab doesn't slowly accumulate unbounded memory. History views always re-fetch the full window from the database regardless.
 - `/api/analytics/summary` and `/api/system/status` are new REST endpoints added for the Analytics and System pages — both are read-only aggregates over the same `telemetry_store.py` functions the other pages already use, so they carry no extra risk to the write path.
 - `/api/latest` and the WebSocket attach two extra fields to each vehicle row: `last_valid_fix` (last position with a fresh GPS fix) and `active_alert` (most recent threat alert in the last 30 minutes). The WebSocket also pushes an `alert_update` message when an alert's SMS is confirmed.
-- The dashboard is still read-only. The only thing the gateway adds for it is the single-row `gateway_status` heartbeat table.
+- The dashboard only writes one thing: the arm/disarm mode (`vehicle_mode` table, plus a `vehicle_mode_events` history), via `POST /api/vehicles/{id}/mode` with the PIN. The gateway reads the mode every couple of seconds. Everything else is read-only.
+- `GET /api/route?node_id=&hours=` returns the route points with a `deviated` flag (used for the red/blue route); `/api/latest` rows include `armed`. The WebSocket also pushes a `mode` message whenever any browser arms or disarms a vehicle.
 - CSS/JS URLs carry a `?v=` version that changes on every dashboard restart, so browsers never mix a cached old script with new pages after an update.
 - `dashboard/static/index.html` is no longer served by any route (kept only as a pointer to the new template structure) — the old single-page dashboard has been fully replaced by the multi-page app described above.

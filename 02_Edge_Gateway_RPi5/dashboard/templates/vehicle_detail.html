@@ -10,6 +10,12 @@
     <a href="/fleet" class="back-link">&larr; Fleet</a>
     <h2 style="margin:0;">Vehicle {{ node_id }}</h2>
     <span class="badge" id="vd-status-badge">—</span>
+    <span id="vd-mode-badge"></span>
+    <button class="btn" id="vd-mode-btn" style="margin-left:auto;display:none;">—</button>
+  </div>
+  <div class="mvc-meta" id="vd-mode-help" style="margin:-6px 0 14px;">
+    <strong>Armed</strong>: any motion raises a theft alert (use when parked).
+    <strong>Disarmed</strong>: you are using the vehicle; only the Isolation Forest can alert, and your driving is learned as normal.
   </div>
 
   <div class="card card-pad" id="vd-nodata" style="display:none;margin-bottom:16px;">
@@ -31,6 +37,10 @@
       <div class="mvc-meta" style="margin-top:4px;">Last packet <span data-ts="" id="vd-lastseen">—</span>
         &middot; <a id="vd-maplink" href="#" target="_blank" rel="noopener" style="color:var(--accent-2);display:none;">open in Google Maps &rarr;</a></div>
       <div class="mvc-meta" style="margin-top:4px;" id="vd-route-note"></div>
+      <div class="mvc-meta" style="margin-top:6px;">
+        <span style="display:inline-block;width:18px;height:4px;background:#3b82f6;vertical-align:middle;border-radius:2px;"></span> normal route
+        &nbsp;&nbsp;<span style="display:inline-block;width:18px;height:4px;background:#ef4444;vertical-align:middle;border-radius:2px;"></span> route after a theft alert (until disarmed)
+      </div>
     </div>
     <div class="card card-pad">
       <h4 style="margin:0 0 10px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;">Alert history for this vehicle</h4>

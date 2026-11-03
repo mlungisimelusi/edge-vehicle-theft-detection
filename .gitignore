@@ -20,3 +20,16 @@ Beta_Demo/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Secrets (generate_secrets.py) - never commit
+02_Edge_Gateway_RPi5/gateway/secrets.json
+01_Mobile_Node_ESP32/esp32_mobile_node/lora_key.h
+
+# Evaluation output
+02_Edge_Gateway_RPi5/gateway/results/
+
+# Assessment documents (kept local; public copies could affect the similarity check)
+Assessment4_Final/
+
+# Build artefacts
+*.hex

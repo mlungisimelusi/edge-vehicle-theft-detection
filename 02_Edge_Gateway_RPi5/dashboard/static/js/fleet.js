@@ -32,6 +32,7 @@ function render() {
     tr.innerHTML = `
       <td><strong>Vehicle ${nodeId}</strong></td>
       <td><span class="badge ${st.cls}">${st.label}</span></td>
+      <td>${row.armed === undefined ? '—' : window.Dashboard.modeBadge(row.armed)}</td>
       <td>${row.gps_valid ? row.speed_kmph.toFixed(1) + ' km/h' : '—'}</td>
       <td>${window.Dashboard.volts(row.battery_millivolts)}</td>
       <td>${row.satellites}</td>
@@ -64,6 +65,11 @@ window.Dashboard.on('telemetry', (row) => { rows[row.node_id] = row; render(); }
 window.Dashboard.on('alert', (alert) => {
   if (!rows[alert.node_id]) return;
   rows[alert.node_id] = window.Dashboard.applyAlertToRow(rows[alert.node_id], alert);
+  render();
+});
+window.Dashboard.on('mode', (m) => {
+  if (!rows[m.node_id]) return;
+  rows[m.node_id] = { ...rows[m.node_id], armed: m.armed, ...(m.armed ? {} : { active_alert: null }) };
   render();
 });
 window.Dashboard.on('tick', render);

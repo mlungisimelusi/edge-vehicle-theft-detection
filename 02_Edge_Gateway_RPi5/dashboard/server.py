@@ -42,17 +42,20 @@ network.
 """
 
 import asyncio
+import hmac
+import json
 import logging
 import math
 import os
 import sys
 import time
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 # telemetry_store.py lives in the sibling gateway/ package and is the single
 # source of truth for the DB schema — imported directly rather than
@@ -79,6 +82,29 @@ GATEWAY_HEARTBEAT_STALE_SECONDS = 60
 SMS_WATCH_SECONDS = 3600
 
 SERVER_STARTED_AT = time.time()
+
+GATEWAY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gateway")
+
+
+def _read_json(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def default_armed() -> bool:
+    """Mode of a vehicle that has never been armed/disarmed — must match the
+    gateway, so it's read from the gateway's own config file."""
+    return bool(_read_json(os.path.join(GATEWAY_DIR, "gateway_config.json")).get("default_armed", True))
+
+
+def dashboard_pin() -> Optional[str]:
+    """PIN for arming/disarming, from gateway/secrets.json (generate_secrets.py)
+    or the VTD_DASHBOARD_PIN environment variable (used by the simulation)."""
+    return os.environ.get("VTD_DASHBOARD_PIN") or \
+        _read_json(os.path.join(GATEWAY_DIR, "secrets.json")).get("dashboard_pin")
 
 app = FastAPI(title="Vehicle Theft Detection Dashboard")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
@@ -150,20 +176,52 @@ def _enrich(row: dict) -> dict:
     latest telemetry row alone can't tell them:
         last_valid_fix  where the vehicle was last seen with a fresh GPS fix
                         (the latest packet may be a stale-GPS motion packet)
-        active_alert    its most recent threat alert within ALERT_ACTIVE_SECONDS
+        active_alert    its most recent threat alert within ALERT_ACTIVE_SECONDS,
+                        unless the owner has disarmed since (acknowledged it)
+        armed           the vehicle's current arm/disarm mode
     Blocking (SQLite) — call via asyncio.to_thread."""
-    fix = store.get_last_valid_fix(row["node_id"])
+    node_id = row["node_id"]
+    fix = store.get_last_valid_fix(node_id)
     since = time.time() - ALERT_ACTIVE_SECONDS
-    alert = store.get_latest_threat_alert(row["node_id"], since)
+    disarmed_at = store.get_last_disarm_time(node_id)
+    if disarmed_at is not None:
+        since = max(since, disarmed_at)          # disarming acknowledges earlier alerts
+    alert = store.get_latest_threat_alert(node_id, since)
     if alert is not None and alert["reason"] == "loss_of_contact" and row["received_at"] > alert["sent_at"]:
         # Contact has been restored since that alert; an earlier THEFT alert
         # in the window must still keep the vehicle red.
-        theft = store.get_latest_threat_alert(row["node_id"], since, exclude_contact=True)
+        theft = store.get_latest_threat_alert(node_id, since, exclude_contact=True)
         if theft is not None:
             alert = theft
     row["last_valid_fix"] = _row_to_dict(fix) if fix else None
     row["active_alert"] = _row_to_dict(alert) if alert else None
+    row["armed"] = store.get_vehicle_armed(node_id, default_armed())
     return row
+
+
+def _route(node_id: int, hours: float) -> List[dict]:
+    """Route points with fresh GPS fixes, each marked `deviated` if it was
+    recorded after a theft alert and before the owner disarmed (or before the
+    alert expired) — drawn red on the map, the normal route blue."""
+    now = time.time()
+    since = now - hours * 3600.0
+    rows = [_row_to_dict(r) for r in store.get_telemetry_since(node_id, since, 20000) if r["gps_valid"]]
+    alerts = store.get_theft_alerts_since(node_id, since - ALERT_ACTIVE_SECONDS)
+    disarms = [e["changed_at"] for e in store.get_mode_events(node_id, since - ALERT_ACTIVE_SECONDS)
+               if not e["armed"]]
+    windows = []
+    for a in alerts:
+        end = a["sent_at"] + ALERT_ACTIVE_SECONDS
+        later_disarms = [d for d in disarms if d > a["sent_at"]]
+        if later_disarms:
+            end = min(end, later_disarms[0])
+        windows.append((a["sent_at"], end))
+    out = []
+    for r in rows:
+        t = r["received_at"]
+        out.append({"lat": r["latitude"], "lon": r["longitude"], "t": t,
+                    "deviated": any(start <= t <= end for start, end in windows)})
+    return out
 
 
 def _latest_enriched(node_id: Optional[int] = None) -> List[dict]:
@@ -189,19 +247,23 @@ def _packet_delivery_ratio(rows: List[dict]) -> Optional[dict]:
     seen. A sequence number that goes backwards marks a node restart and
     starts a new segment. Rows from legacy (v1) firmware have no sequence
     number and are ignored. Returns None if there is nothing to measure."""
-    seqs = [r["sequence_number"] for r in rows if r.get("sequence_number") is not None]
-    if not seqs:
+    pairs = [(r.get("boot_epoch"), r["sequence_number"]) for r in rows
+             if r.get("sequence_number") is not None]
+    if not pairs:
         return None
     expected = received = 0
     segment: Set[int] = set()
-    first = prev = seqs[0]
-    for seq in seqs:
-        if seq < prev:                       # node restarted: close the segment
+    prev_epoch, first = pairs[0]
+    prev = first
+    for epoch, seq in pairs:
+        # A new boot epoch (v3) or a sequence going backwards (v2) means the
+        # node restarted: close the segment.
+        if epoch != prev_epoch or seq < prev:
             expected += prev - first + 1
             received += len(segment)
             segment, first = set(), seq
         segment.add(seq)
-        prev = seq
+        prev, prev_epoch = seq, epoch
     expected += prev - first + 1
     received += len(segment)
     if expected <= 0:
@@ -230,8 +292,17 @@ async def _poll_for_changes() -> None:
         if not r["sms_sent"] and time.time() - r["sent_at"] < SMS_WATCH_SECONDS:
             unsent[r["id"]] = r["sent_at"]
 
+    modes = await asyncio.to_thread(store.get_vehicle_modes)
+
     while True:
         try:
+            # Arm/disarm changes (made from any browser) are pushed to all pages.
+            current_modes = await asyncio.to_thread(store.get_vehicle_modes)
+            for node_id, mode in current_modes.items():
+                if modes.get(node_id) != mode:
+                    await manager.broadcast({"type": "mode", "data": {"node_id": node_id, **mode}})
+            modes = current_modes
+
             new_telemetry = await asyncio.to_thread(store.get_telemetry_after_id, last_telemetry_id)
             for row in new_telemetry:
                 data = await asyncio.to_thread(_enrich, _row_to_dict(row))
@@ -325,6 +396,47 @@ async def api_history(node_id: int, hours: float = 24.0, limit: int = 5000):
 async def api_alerts(node_id: Optional[int] = None, limit: int = 100):
     rows = await asyncio.to_thread(store.get_recent_alerts, node_id, limit)
     return [_row_to_dict(r) for r in rows]
+
+
+@app.get("/api/route")
+async def api_route(node_id: int, hours: float = 24.0):
+    return await asyncio.to_thread(_route, node_id, hours)
+
+
+class ModeChange(BaseModel):
+    armed: bool
+    pin: Optional[str] = None
+
+
+_pin_failures: Dict[str, List[float]] = {}
+PIN_MAX_FAILURES = 5
+PIN_LOCKOUT_SECONDS = 60
+
+
+@app.get("/api/vehicles/{node_id}/mode")
+async def api_get_mode(node_id: int):
+    armed = await asyncio.to_thread(store.get_vehicle_armed, node_id, default_armed())
+    return {"node_id": node_id, "armed": armed, "pin_required": dashboard_pin() is not None}
+
+
+@app.post("/api/vehicles/{node_id}/mode")
+async def api_set_mode(node_id: int, change: ModeChange, request: Request):
+    """Arm or disarm a vehicle. Protected by the dashboard PIN, with a short
+    lockout after repeated wrong PINs, because the dashboard has no login."""
+    client = request.client.host if request.client else "unknown"
+    now = time.time()
+    recent = [t for t in _pin_failures.get(client, []) if now - t < PIN_LOCKOUT_SECONDS]
+    _pin_failures[client] = recent
+    if len(recent) >= PIN_MAX_FAILURES:
+        raise HTTPException(status_code=429, detail="Too many wrong PINs. Wait a minute and try again.")
+    pin = dashboard_pin()
+    if pin is not None and not hmac.compare_digest(str(change.pin or ""), str(pin)):
+        recent.append(now)
+        logger.warning("Wrong arm/disarm PIN for vehicle %d from %s.", node_id, client)
+        raise HTTPException(status_code=403, detail="Wrong PIN.")
+    changed_at = await asyncio.to_thread(store.set_vehicle_armed, node_id, change.armed, f"dashboard ({client})")
+    logger.info("Vehicle %d %s from the dashboard (%s).", node_id, "ARMED" if change.armed else "DISARMED", client)
+    return {"node_id": node_id, "armed": change.armed, "changed_at": changed_at}
 
 
 @app.get("/api/analytics/summary")

@@ -4,3 +4,6 @@ lgpio>=0.2.2.0
 pyserial>=3.5
 numpy>=1.26
 scikit-learn>=1.4
+cryptography>=42
+# optional: charts in eval_session.py report
+# matplotlib>=3.8

@@ -3,5 +3,9 @@
   "gsm_serial_port": "/dev/ttyAMA0",
   "contact_timeout_minutes": 16,
   "loss_of_contact_alerts": true,
-  "known_node_ids": [1001]
+  "known_node_ids": [
+    1001
+  ],
+  "require_encryption": true,
+  "default_armed": true
 }

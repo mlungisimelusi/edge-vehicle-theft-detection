@@ -46,6 +46,12 @@ async function load() {
       gsmEl.innerHTML = '<span class="status-dot danger"></span> not ready';
       gsmSub.textContent = 'modem not responding or not registered — retrying';
     }
+    const enc = gw.encryption || 'off';
+    document.getElementById('sys-crypto').innerHTML =
+      `<span class="status-dot ${enc === 'off' ? 'stale' : 'ok'}"></span> ${enc === 'off' ? 'not encrypted' : 'AES-128-GCM'}`;
+    document.getElementById('sys-crypto-sub').textContent =
+      `${enc.includes('required') ? 'unencrypted packets rejected' : (enc === 'off' ? 'no key configured' : 'encrypted + authenticated')}` +
+      ` · ${gw.rejected_packets || 0} forged/replayed packet(s) rejected`;
     document.getElementById('sys-pending').textContent = gw.pending_alerts;
     document.getElementById('sys-lora-packets').textContent = gw.lora_packets.toLocaleString();
     document.getElementById('sys-lora-crc').textContent =

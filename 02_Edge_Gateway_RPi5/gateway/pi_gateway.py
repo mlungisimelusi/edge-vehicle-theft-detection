@@ -20,9 +20,20 @@ Threads:
                                if it drops out — so a slow or failing SMS
                                send never blocks packet processing
 
+Arm / disarm (set per vehicle from the dashboard, stored in SQLite):
+    ARMED            parked / owner away. ANY hardware motion wake is a theft
+                     alert ("Moved while ARMED"), regardless of the model.
+                     Motion while armed is never learned as normal.
+    DISARMED         owner using the vehicle. Only the Isolation Forest can
+                     raise an alert, and the owner's driving is what the model
+                     learns as "normal". Loss of contact is not alerted (the
+                     owner may simply have driven out of LoRa range).
+
 Alert types:
-    anomaly          Isolation Forest (or the cold-start motion rule) flags
-                     a packet as abnormal.
+    armed motion     any motion while the vehicle is armed.
+    anomaly          the Isolation Forest flags a packet as abnormal (works in
+                     both modes once the model has finished its learning
+                     period).
     loss of contact  a vehicle that was reporting goes silent for longer
                      than CONTACT_TIMEOUT (default 16 min = 3 missed 5-min
                      heartbeats + margin). This is what catches a vehicle
@@ -34,7 +45,10 @@ Alert types:
 
 Telemetry packet formats (little-endian, packed — must match the ESP32
 firmware's TelemetryPacket struct byte for byte):
-    v2 (current), 31 bytes, "<BBIIffffBBBH":
+    v3 (current), 51 bytes, AES-128-GCM encrypted and authenticated — see
+        lora_crypto.py. Replays are rejected with certainty using the
+        authenticated (boot epoch, sequence) pair.
+    v2 (unencrypted, older firmware), 31 bytes, "<BBIIffffBBBH":
         uint8  protocolVersion (=2), uint8 packetType, uint32 nodeId,
         uint32 sequence, float lat, float lon, float speedKmph,
         float headingDeg, uint8 satellites, uint8 motionFlag,
@@ -42,9 +56,10 @@ firmware's TelemetryPacket struct byte for byte):
     v1 (legacy firmware), 29 bytes, "<IffffBBBHI":
         accepted for backward compatibility (no sequence number / type).
 
-Configuration: gateway_config.json next to this file (see
-gateway_config.example.json). The alert phone number(s) can also be given
-with the VTD_ALERT_NUMBERS environment variable (comma-separated).
+Configuration: gateway_config.json next to this file. The alert phone
+number(s) can also be given with the VTD_ALERT_NUMBERS environment variable
+(comma-separated). The LoRa AES key is in secrets.json (generate_secrets.py),
+which is never committed to Git.
 
 Run:   python3 pi_gateway.py
 Stop:  Ctrl+C (or SIGTERM from systemd) — radio, modem and threads are
@@ -71,6 +86,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from sklearn.ensemble import IsolationForest
 
+import lora_crypto
 import telemetry_store
 from sim800_gsm import SMS_MAX_CHARS, Sim800Gsm
 from sx127x_lora import Sx127xLoRa
@@ -128,17 +144,37 @@ RADIO_HEALTH_CHECK_INTERVAL_SECONDS = 60
 # window of 2000 samples holds roughly a week of history — enough for the
 # hour-of-day features to mean something.
 FEATURE_WINDOW_SIZE = 2000
-# Learning period before each model is trusted. During it, any hardware
-# motion wake raises an alert (cold-start rule). It must cover real usage:
-# with only a handful of samples (the old value was 20 — under 2 hours of
-# heartbeats), the model learned a few bench shake tests as "normal" and
-# then stayed silent when the node was shaken again.
-#   context model   288 packets = about one day of 5-minute heartbeats
-#   movement model  100 fresh GPS fixes
+# Learning period before each model is trusted (it reports "learning" and
+# never alerts until then; arming the vehicle protects it meanwhile).
+#   movement model  100 driving packets with a fresh GPS fix, recorded while
+#                   disarmed — a few of the owner's trips
+#   context model   288 packets (score stored for analysis only)
+# The very first version used 20 samples, and the model learned a few bench
+# shake tests as "normal"; motion while ARMED is now never learned at all.
 CONTEXT_MIN_SAMPLES = 288
 MOVEMENT_MIN_SAMPLES = 100
 REFIT_INTERVAL_SAMPLES = 5
-ISOLATION_FOREST_CONTAMINATION = 0.05
+# Tuned with ml_benchmark.py: 0.05 (the first value) scored ~5% of normal
+# packets as outliers, and because consecutive driving packets are similar,
+# those outliers came in runs - a false alarm on ~44% of normal 15-minute
+# trips even with the 3-of-5 rule. 0.01 cut that to ~10%.
+ISOLATION_FOREST_CONTAMINATION = 0.01
+# Persistence rule: an Isolation Forest alert needs ML_CONFIRM_COUNT outliers
+# among the last ML_CONFIRM_WINDOW driving packets. Alerting on a single
+# outlier would raise a false alarm on most drives; a genuinely abnormal
+# drive is abnormal packet after packet, so it is still confirmed quickly.
+ML_CONFIRM_WINDOW = 5
+ML_CONFIRM_COUNT = 3
+# Learned speed envelope (checked before the Isolation Forest). An Isolation
+# Forest cannot score values far OUTSIDE its training range as more unusual
+# than the most extreme training values (they fall into the same leaf), so a
+# 150 km/h getaway was missed about half the time. Any packet faster than
+# ENVELOPE_SPEED_FACTOR x the fastest speed the owner has ever driven - or a
+# position jump implying ENVELOPE_IMPLIED_FACTOR x that - is physically
+# implausible for this owner and alerts at once, without the 3-of-5 wait
+# (a GPS jump is a single packet and could never collect 3 votes).
+ENVELOPE_SPEED_FACTOR = 1.25
+ENVELOPE_IMPLIED_FACTOR = 1.5
 ISOLATION_FOREST_N_ESTIMATORS = 100
 RANDOM_STATE = 42
 STATIONARY_SPEED_KMPH = 3.0          # below this, GPS heading is just noise
@@ -165,6 +201,10 @@ class GatewayConfig:
     contact_timeout_seconds: float
     loss_of_contact_alerts: bool
     known_node_ids: List[int]
+    lora_key: Optional[bytes] = None          # AES-128 key for v3 packets
+    require_encryption: bool = False          # reject unencrypted (v1/v2) packets
+    default_armed: bool = True                # mode for a vehicle never armed/disarmed
+    log_raw_packets: bool = False             # show each packet's bytes as received over the air
 
 
 def load_config(path: str = CONFIG_PATH) -> GatewayConfig:
@@ -198,6 +238,17 @@ def load_config(path: str = CONFIG_PATH) -> GatewayConfig:
             continue
         valid_numbers.append(number)
 
+    key = None
+    try:
+        key = lora_crypto.load_key()
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        logger.error("Could not load the LoRa key from secrets.json (%s).", exc)
+    require = bool(raw.get("require_encryption", key is not None))
+    if key is None:
+        logger.warning("No LoRa key found (run generate_secrets.py) — encrypted v3 packets can't be "
+                       "read%s.", "; EVERY packet will be rejected because require_encryption is on"
+                       if require else "; accepting unencrypted packets only")
+
     return GatewayConfig(
         alert_phone_numbers=valid_numbers,
         gsm_serial_port=raw.get("gsm_serial_port") or None,
@@ -205,6 +256,10 @@ def load_config(path: str = CONFIG_PATH) -> GatewayConfig:
                                               DEFAULT_CONTACT_TIMEOUT_MINUTES)) * 60.0,
         loss_of_contact_alerts=bool(raw.get("loss_of_contact_alerts", True)),
         known_node_ids=[int(n) for n in raw.get("known_node_ids", [])],
+        lora_key=key,
+        require_encryption=require,
+        default_armed=bool(raw.get("default_armed", True)),
+        log_raw_packets=bool(raw.get("log_raw_packets", False)),
     )
 
 
@@ -228,11 +283,28 @@ class Telemetry:
     packet_type: Optional[int] = None
     protocol_version: int = PROTOCOL_VERSION
     received_at: float = field(default_factory=time.time)
+    boot_epoch: Optional[int] = None
+    encrypted: bool = False
 
 
-def parse_telemetry_packet(payload: bytes, rssi_dbm: int, snr_db: float) -> Optional[Telemetry]:
+def parse_telemetry_packet(payload: bytes, rssi_dbm: int, snr_db: float,
+                           key: Optional[bytes] = None) -> Optional[Telemetry]:
+    """Returns None for malformed packets. Raises
+    lora_crypto.AuthenticationError for a v3 packet that fails verification."""
+    boot_epoch, encrypted = None, False
     try:
-        if len(payload) == TELEMETRY_V2_SIZE:
+        if len(payload) == lora_crypto.PACKET_SIZE and payload[0] == lora_crypto.PROTOCOL_VERSION_ENCRYPTED:
+            if key is None:
+                logger.warning("Dropping encrypted packet: no LoRa key configured (run generate_secrets.py).")
+                return None
+            (version, packet_type, node_id, boot_epoch, sequence), body = \
+                lora_crypto.decrypt_packet(key, payload)
+            lat, lon, speed, heading, sats, motion_flag, gps_valid, batt_mv = body
+            encrypted = True
+            if packet_type not in PACKET_TYPE_NAMES:
+                logger.warning("Dropping packet with unknown packet type %d.", packet_type)
+                return None
+        elif len(payload) == TELEMETRY_V2_SIZE:
             (version, packet_type, node_id, sequence, lat, lon, speed, heading, sats,
              motion_flag, gps_valid, batt_mv) = struct.unpack(TELEMETRY_V2_FORMAT, payload)
             if version != PROTOCOL_VERSION:
@@ -247,10 +319,11 @@ def parse_telemetry_packet(payload: bytes, rssi_dbm: int, snr_db: float) -> Opti
              batt_mv, _uptime) = struct.unpack(TELEMETRY_V1_FORMAT, payload)
             version, packet_type, sequence = 1, None, None
         else:
-            logger.warning("Dropping packet with unexpected size %d bytes (expected %d, or %d for "
-                           "legacy v1 firmware).", len(payload), TELEMETRY_V2_SIZE, TELEMETRY_V1_SIZE)
+            logger.warning("Dropping packet with unexpected size %d bytes (expected %d encrypted, or "
+                           "%d/%d from older firmware).", len(payload), lora_crypto.PACKET_SIZE,
+                           TELEMETRY_V2_SIZE, TELEMETRY_V1_SIZE)
             return None
-    except struct.error as exc:
+    except (struct.error, ValueError) as exc:
         logger.warning("Failed to unpack telemetry packet: %s", exc)
         return None
 
@@ -273,6 +346,7 @@ def parse_telemetry_packet(payload: bytes, rssi_dbm: int, snr_db: float) -> Opti
         satellites=sats, motion_flag=bool(motion_flag), gps_valid=gps_valid,
         battery_millivolts=batt_mv, rssi_dbm=rssi_dbm, snr_db=snr_db,
         sequence=sequence, packet_type=packet_type, protocol_version=version,
+        boot_epoch=boot_epoch, encrypted=encrypted,
     )
 
 
@@ -347,6 +421,7 @@ class RollingIsolationForest:
         self.min_samples = min_samples
         self.history: deque = deque(maxlen=FEATURE_WINDOW_SIZE)
         self.model: Optional[IsolationForest] = None
+        self.max_speed = 0.0
         self.samples_since_fit = 0
 
     @property
@@ -363,8 +438,10 @@ class RollingIsolationForest:
             contamination=ISOLATION_FOREST_CONTAMINATION,
             random_state=RANDOM_STATE,
         )
-        model.fit(np.vstack(self.history))
+        data = np.vstack(self.history)
+        model.fit(data)
         self.model = model
+        self.max_speed = float(data[:, 0].max())   # column 0 = GPS speed (movement model)
         self.samples_since_fit = 0
 
     def score(self, x: np.ndarray) -> Tuple[bool, float]:
@@ -377,49 +454,72 @@ class RollingIsolationForest:
         self.samples_since_fit += 1
 
 
+def _is_driving(t: Telemetry) -> bool:
+    return t.motion_flag or t.speed_kmph >= STATIONARY_SPEED_KMPH
+
+
 class NodeAnomalyDetector:
-    """Two models per vehicle:
+    """The Isolation Forest judges HOW the vehicle is being driven:
         movement model  speed, heading, implied speed, motion, time of day —
-                        used for packets WITH a fresh GPS fix.
-        context model   motion + time of day only — used for packets without
-                        a fresh fix (e.g. the immediate motion packet sent
-                        before the GPS has locked), which can't be judged on
-                        movement features they don't have.
-    Until either model has enough history, a hardware motion wake is treated
-    as an anomaly (cold-start rule), so the system is never blind while it
-    is still learning."""
+                        trained ONLY on the owner's own driving (packets with
+                        a fresh GPS fix while moving, recorded while
+                        disarmed), and applied only to driving packets.
+    Parked heartbeats are not judged by the model. If they were mixed in,
+    driving would be rare compared to the thousands of parked heartbeats,
+    and Isolation Forest — which scores rarity — would flag the owner's
+    normal driving as anomalous. Whether the vehicle should be moving at all
+    is decided by arming it (any motion while armed is an alert, decided in
+    Gateway, not here).
+
+    A context model (motion + time of day) is also kept and its score stored
+    for analysis, but it never raises alerts on its own: with arm/disarm,
+    "motion at an unusual time" is better answered by the owner's choice to
+    arm the vehicle than by a statistical guess.
+
+    Until the movement model has enough driving history it reports
+    "learning" and never flags anything."""
 
     def __init__(self, node_id: int):
         self.node_id = node_id
         self.movement_model = RollingIsolationForest("movement", MOVEMENT_MIN_SAMPLES)
         self.context_model = RollingIsolationForest("context", CONTEXT_MIN_SAMPLES)
 
-    def evaluate(self, t: Telemetry, previous_fix: Optional[Telemetry]) -> Dict:
+    def evaluate(self, t: Telemetry, previous_fix: Optional[Telemetry], learn: bool = True) -> Dict:
+        """learn=False scores the packet without adding it to the baseline —
+        used for motion while ARMED, which must never become "normal"."""
         self.movement_model.fit_if_due()
         self.context_model.fit_if_due()
 
-        result = {"is_anomaly": False, "reason": "baseline_insufficient", "score": None}
         ctx = context_features(t)
-        mov = movement_features(t, previous_fix) if t.gps_valid else None
+        driving = _is_driving(t)
+        mov = movement_features(t, previous_fix) if (t.gps_valid and driving) else None
 
-        if mov is not None and self.movement_model.ready:
-            is_outlier, score = self.movement_model.score(mov)
-            result.update(score=score, reason="isolation_forest" if is_outlier else "normal",
-                          is_anomaly=is_outlier)
-        elif self.context_model.ready:
-            is_outlier, score = self.context_model.score(ctx)
-            result.update(score=score, reason="isolation_forest_context" if is_outlier else "normal",
-                          is_anomaly=is_outlier)
-        elif t.motion_flag:
-            result.update(is_anomaly=True, reason="coldstart_hardware_motion_flag")
+        if mov is not None:
+            if self.movement_model.ready:
+                is_outlier, score = self.movement_model.score(mov)
+                max_speed = self.movement_model.max_speed
+                if mov[0] > ENVELOPE_SPEED_FACTOR * max_speed or \
+                        mov[3] > ENVELOPE_IMPLIED_FACTOR * ENVELOPE_SPEED_FACTOR * max_speed:
+                    result = {"is_anomaly": True, "score": score, "reason": "speed_envelope",
+                              "immediate": True}
+                else:
+                    result = {"is_anomaly": is_outlier, "score": score,
+                              "reason": "isolation_forest" if is_outlier else "normal"}
+            else:
+                result = {"is_anomaly": False, "reason": "learning", "score": None}
+        else:
+            # Not judged: parked, or no fresh GPS fix to judge the movement by.
+            score = self.context_model.score(ctx)[1] if self.context_model.ready else None
+            result = {"is_anomaly": False, "reason": "no_fix" if driving else "parked", "score": score}
 
-        self.learn(t, previous_fix, ctx, mov)
+        if learn:
+            self.learn(t, previous_fix, ctx, mov)
         return result
 
     def learn(self, t: Telemetry, previous_fix: Optional[Telemetry],
               ctx: Optional[np.ndarray] = None, mov: Optional[np.ndarray] = None) -> None:
         self.context_model.add(ctx if ctx is not None else context_features(t))
-        if t.gps_valid:
+        if t.gps_valid and _is_driving(t):
             self.movement_model.add(mov if mov is not None else movement_features(t, previous_fix))
 
 
@@ -431,12 +531,14 @@ class NodeState:
     last_valid_fix: Optional[Telemetry] = None
     last_packet: Optional[Telemetry] = None
     last_sequence: Optional[int] = None
+    last_epoch: Optional[int] = None
     reset_candidate_sequence: Optional[int] = None
     last_alert_time: float = 0.0
     contact_lost: bool = False
     location_followup_until: float = 0.0
     warned_legacy_firmware: bool = False
     packets_missed: int = 0
+    recent_ml_outliers: deque = field(default_factory=lambda: deque(maxlen=ML_CONFIRM_WINDOW))
 
     def cooldown_active(self, now: float) -> bool:
         return (now - self.last_alert_time) < ALERT_COOLDOWN_SECONDS
@@ -446,8 +548,10 @@ class NodeState:
 # SMS formatting — every message must fit in one 160-character SMS
 # ---------------------------------------------------------------------------
 REASON_LABELS = {
+    "armed_motion": "Moved while ARMED",
     "coldstart_hardware_motion_flag": "Motion detected (learning)",
     "isolation_forest": "Unusual movement pattern (ML)",
+    "speed_envelope": "Faster than owner ever moves",
     "isolation_forest_context": "Motion at unusual time (ML)",
     "loss_of_contact": "Contact lost",
     "location_update": "Location update",
@@ -566,7 +670,7 @@ class AlertDispatcher(threading.Thread):
         return self._ready
 
     def submit(self, node_id: int, reason: str, score: Optional[float], fix: Optional[Telemetry],
-               speed_kmph: float, message: str) -> None:
+               speed_kmph: float, message: str, trigger_received_at: Optional[float] = None) -> None:
         """Record the alert in the database immediately (so it's on the
         dashboard even if the SMS takes minutes), then queue the SMS."""
         alert_id = telemetry_store.insert_alert({
@@ -574,6 +678,7 @@ class AlertDispatcher(threading.Thread):
             "latitude": fix.latitude if fix else 0.0,
             "longitude": fix.longitude if fix else 0.0,
             "speed_kmph": speed_kmph, "sms_sent": False, "sent_at": time.time(),
+            "trigger_received_at": trigger_received_at,
         })
         logger.warning("ALERT #%d for node %d (%s) queued for SMS:\n%s",
                        alert_id, node_id, reason, message)
@@ -678,6 +783,36 @@ class Gateway:
         self._alerts = AlertDispatcher(config.gsm_serial_port, config.alert_phone_numbers)
         self._stop_event = threading.Event()
         self._started_at = time.time()
+        self._rejected_packets = 0
+        self._mode_cache: Dict[int, Tuple[bool, float]] = {}
+
+    # -----------------------------------------------------------------
+    MODE_CACHE_SECONDS = 2.0
+
+    def _is_armed(self, node_id: int) -> bool:
+        """Arm/disarm is set on the dashboard (a separate process), so it is
+        read from the database, cached for a couple of seconds."""
+        cached = self._mode_cache.get(node_id)
+        now = time.monotonic()
+        if cached is None or now - cached[1] > self.MODE_CACHE_SECONDS:
+            armed = telemetry_store.get_vehicle_armed(node_id, self._config.default_armed)
+            if cached is not None and cached[0] != armed:
+                logger.warning("Node %d is now %s.", node_id, "ARMED" if armed else "DISARMED")
+            self._mode_cache[node_id] = (armed, now)
+            return armed
+        return cached[0]
+
+    def _armed_at(self, events: List, ts: float) -> bool:
+        armed = self._config.default_armed
+        for e in events:
+            if e["changed_at"] > ts:
+                break
+            armed = bool(e["armed"])
+        return armed
+
+    def _reject(self, reason: str, *args) -> None:
+        self._rejected_packets += 1
+        logger.warning("REJECTED packet: " + reason, *args)
 
     # -----------------------------------------------------------------
     def _on_lora_packet(self, payload: bytes, rssi_dbm: int, snr_db: float) -> None:
@@ -695,6 +830,8 @@ class Gateway:
         gateway restart doesn't drop every vehicle back into cold-start mode
         (where every motion event raises an alert)."""
         rows = telemetry_store.get_recent_telemetry_per_node(FEATURE_WINDOW_SIZE)
+        mode_events: Dict[int, List] = {}
+        skipped = 0
         for row in rows:
             t = Telemetry(
                 node_id=row["node_id"], latitude=row["latitude"], longitude=row["longitude"],
@@ -705,23 +842,31 @@ class Gateway:
                 sequence=row["sequence_number"], packet_type=row["packet_type"],
                 received_at=row["received_at"],
             )
+            t.boot_epoch = row["boot_epoch"]
             state = self._node(t.node_id)
-            state.detector.learn(t, state.last_valid_fix)
+            if t.node_id not in mode_events:
+                mode_events[t.node_id] = list(telemetry_store.get_mode_events(t.node_id))
+            # Motion while armed (thefts, tests) is never part of "normal".
+            if t.motion_flag and self._armed_at(mode_events[t.node_id], t.received_at):
+                skipped += 1
+            else:
+                state.detector.learn(t, state.last_valid_fix)
             if t.gps_valid:
                 state.last_valid_fix = t
             if t.sequence is not None:
                 state.last_sequence = t.sequence
+                state.last_epoch = t.boot_epoch
             state.last_packet = t
             state.last_seen = t.received_at
 
+        if skipped:
+            logger.info("Left %d motion-while-armed packet(s) out of the learned baseline.", skipped)
         for state in self._nodes.values():
-            ctx_n = len(state.detector.context_model.history)
             mov_n = len(state.detector.movement_model.history)
-            logger.info("Node %d: restored history — context model %d/%d, movement model %d/%d samples "
-                        "(%s), last seen %s.",
-                        state.node_id, ctx_n, CONTEXT_MIN_SAMPLES, mov_n, MOVEMENT_MIN_SAMPLES,
-                        "learning period: every motion raises an alert" if ctx_n < CONTEXT_MIN_SAMPLES
-                        else "trained", _fmt_time(state.last_seen))
+            logger.info("Node %d: restored history — %d driving samples for the Isolation Forest (%s), "
+                        "last seen %s.", state.node_id, mov_n,
+                        f"still learning, needs {MOVEMENT_MIN_SAMPLES}; arming protects the vehicle meanwhile"
+                        if mov_n < MOVEMENT_MIN_SAMPLES else "trained", _fmt_time(state.last_seen))
             if self._started_at - state.last_seen > self._config.contact_timeout_seconds:
                 # Already silent before the gateway started (e.g. an old test
                 # node). Don't SMS about it on every restart — just note it.
@@ -743,6 +888,8 @@ class Gateway:
         (AES/HMAC), which is listed as future work."""
         if t.sequence is None:
             return True
+        if t.boot_epoch is not None:
+            return self._check_authenticated_sequence(state, t)
         last = state.last_sequence
         if last is None:
             state.last_sequence = t.sequence
@@ -775,12 +922,62 @@ class Gateway:
         state.last_sequence = t.sequence
         return True
 
+    def _check_authenticated_sequence(self, state: NodeState, t: Telemetry) -> bool:
+        """v3 packets: (boot epoch, sequence) is covered by the GCM tag, so
+        it can't be altered. It must strictly increase; anything else is a
+        duplicate or a replayed recording and is rejected outright."""
+        current = (t.boot_epoch, t.sequence)
+        if state.last_epoch is not None and state.last_sequence is not None:
+            last = (state.last_epoch, state.last_sequence)
+            if current == last:
+                logger.info("Node %d: duplicate packet (epoch %d, seq %d) dropped.", t.node_id, *current)
+                return False
+            if current < last:
+                self._reject("node %d replayed packet (epoch %d, seq %d) — already seen up to "
+                             "(epoch %d, seq %d).", t.node_id, *current, *last)
+                return False
+            if t.boot_epoch > state.last_epoch:
+                logger.info("Node %d: new boot epoch %d (node was power-cycled).", t.node_id, t.boot_epoch)
+            elif t.sequence > state.last_sequence + 1:
+                missed = t.sequence - state.last_sequence - 1
+                state.packets_missed += missed
+                logger.info("Node %d: %d packet(s) missed (seq %d -> %d).", t.node_id, missed,
+                            state.last_sequence, t.sequence)
+        state.last_epoch, state.last_sequence = current
+        return True
+
+    def _log_raw(self, payload: bytes) -> None:
+        """Demonstration aid: print the packet exactly as anyone listening on
+        433 MHz would capture it. For an encrypted packet only the header is
+        readable; the position, speed and motion data are ciphertext."""
+        if len(payload) == lora_crypto.PACKET_SIZE and payload[0] == lora_crypto.PROTOCOL_VERSION_ENCRYPTED:
+            h = lora_crypto.HEADER_SIZE
+            b = h + lora_crypto.BODY_SIZE
+            logger.info("RAW over the air (%d bytes, what an eavesdropper sees):\n"
+                        "    header (clear, authenticated): %s\n"
+                        "    ENCRYPTED body (position, speed, motion, battery): %s\n"
+                        "    authentication tag: %s",
+                        len(payload), payload[:h].hex(" "), payload[h:b].hex(" "), payload[b:].hex(" "))
+        else:
+            logger.info("RAW over the air (%d bytes, NOT encrypted): %s", len(payload), payload.hex(" "))
+
     # -----------------------------------------------------------------
     def _process_packet(self, payload: bytes, rssi_dbm: int, snr_db: float, received_at: float) -> None:
-        t = parse_telemetry_packet(payload, rssi_dbm, snr_db)
+        if self._config.log_raw_packets:
+            self._log_raw(payload)
+        try:
+            t = parse_telemetry_packet(payload, rssi_dbm, snr_db, self._config.lora_key)
+        except lora_crypto.AuthenticationError as exc:
+            self._reject("%s — forged, altered, corrupted, or encrypted with a different key.", exc)
+            return
         if t is None:
             return
         t.received_at = received_at
+
+        if not t.encrypted and self._config.require_encryption:
+            self._reject("unencrypted v%d packet claiming node %d (require_encryption is on).",
+                         t.protocol_version, t.node_id)
+            return
 
         if self._config.known_node_ids and t.node_id not in self._config.known_node_ids:
             logger.warning("Ignoring packet from unknown node %d (not in known_node_ids).", t.node_id)
@@ -795,10 +992,12 @@ class Gateway:
         if not self._check_sequence(state, t):
             return
 
+        armed = self._is_armed(t.node_id)
         logger.info(
-            "Node %d: %s seq=%s lat=%.6f lon=%.6f speed=%.1fkm/h motion=%d gpsValid=%d "
+            "Node %d [%s%s]: %s seq=%s lat=%.6f lon=%.6f speed=%.1fkm/h motion=%d gpsValid=%d "
             "batt=%dmV rssi=%ddBm snr=%.1fdB",
-            t.node_id, PACKET_TYPE_NAMES.get(t.packet_type, "v1"), t.sequence, t.latitude,
+            t.node_id, "ARMED" if armed else "disarmed", ", AES" if t.encrypted else "",
+            PACKET_TYPE_NAMES.get(t.packet_type, "v1"), t.sequence, t.latitude,
             t.longitude, t.speed_kmph, t.motion_flag, t.gps_valid, t.battery_millivolts,
             t.rssi_dbm, t.snr_db,
         )
@@ -811,9 +1010,23 @@ class Gateway:
         state.last_packet = t
 
         previous_fix = state.last_valid_fix
-        anomaly = state.detector.evaluate(t, previous_fix)
+        # Motion while armed is a theft (or a test of one): score it, but
+        # never let it become part of the learned "normal" behaviour.
+        anomaly = state.detector.evaluate(t, previous_fix, learn=not (armed and t.motion_flag))
         if t.gps_valid:
             state.last_valid_fix = t
+
+        if anomaly["reason"] in ("isolation_forest", "speed_envelope", "normal"):
+            state.recent_ml_outliers.append(anomaly["is_anomaly"])
+        ml_votes = sum(state.recent_ml_outliers)
+        ml_confirmed = anomaly["is_anomaly"] and (anomaly.get("immediate") or ml_votes >= ML_CONFIRM_COUNT)
+
+        if armed and t.motion_flag:
+            alert_reason = "armed_motion"
+        elif ml_confirmed:
+            alert_reason = anomaly["reason"]
+        else:
+            alert_reason = None
 
         telemetry_store.insert_telemetry({
             "node_id": t.node_id, "latitude": t.latitude, "longitude": t.longitude,
@@ -822,33 +1035,43 @@ class Gateway:
             "gps_valid": t.gps_valid, "battery_millivolts": t.battery_millivolts,
             "sequence_number": t.sequence, "packet_type": t.packet_type,
             "rssi_dbm": t.rssi_dbm, "snr_db": t.snr_db,
-            "anomaly_score": anomaly["score"], "is_anomaly": anomaly["is_anomaly"],
-            "received_at": t.received_at,
+            "anomaly_score": anomaly["score"], "is_anomaly": alert_reason is not None,
+            "received_at": t.received_at, "boot_epoch": t.boot_epoch,
+            "protocol_version": t.protocol_version,
         })
 
         now = t.received_at
-        if not anomaly["is_anomaly"]:
+        if alert_reason is None:
             # Say WHY no alert was raised, so a silent gateway is never a
             # mystery (e.g. the model has learned this pattern as normal).
-            if anomaly["reason"] == "normal":
-                logger.info("Node %d: judged normal by the Isolation Forest (score=%.3f) — no alert.",
+            reason = anomaly["reason"]
+            if anomaly["is_anomaly"]:
+                logger.info("Node %d: Isolation Forest outlier (score=%.3f), %d of the last %d driving "
+                            "packets — %d needed to confirm, no alert yet.", t.node_id, anomaly["score"],
+                            ml_votes, len(state.recent_ml_outliers), ML_CONFIRM_COUNT)
+            elif reason == "normal":
+                logger.info("Node %d: driving judged normal by the Isolation Forest (score=%.3f) — no alert.",
                             t.node_id, anomaly["score"])
+            elif reason == "parked":
+                logger.info("Node %d: parked, no motion — no alert.", t.node_id)
+            elif reason == "no_fix":
+                logger.info("Node %d: motion while DISARMED, no GPS fix yet to judge it — no alert.", t.node_id)
             else:
-                ctx_n = len(state.detector.context_model.history)
-                logger.info("Node %d: no motion, still learning (%d/%d samples) — no alert.",
-                            t.node_id, ctx_n, CONTEXT_MIN_SAMPLES)
-        if anomaly["is_anomaly"]:
+                mov_n = len(state.detector.movement_model.history)
+                logger.info("Node %d: driving while DISARMED, model still learning the owner's driving "
+                            "(%d/%d samples) — no alert.", t.node_id, mov_n, MOVEMENT_MIN_SAMPLES)
+        else:
             if state.cooldown_active(now):
-                logger.info("Node %d: anomaly (%s) during alert cooldown — no new SMS.",
-                            t.node_id, anomaly["reason"])
+                logger.info("Node %d: %s during alert cooldown — no new SMS.", t.node_id, alert_reason)
             else:
-                logger.warning("Node %d: ANOMALY CONFIRMED (%s, score=%s).",
-                               t.node_id, anomaly["reason"], anomaly["score"])
+                logger.warning("Node %d: THEFT ALERT (%s, score=%s).",
+                               t.node_id, alert_reason, anomaly["score"])
                 fix = t if t.gps_valid else state.last_valid_fix
                 self._alerts.submit(
-                    node_id=t.node_id, reason=anomaly["reason"], score=anomaly["score"], fix=fix,
+                    node_id=t.node_id, reason=alert_reason, score=anomaly["score"], fix=fix,
                     speed_kmph=t.speed_kmph,
-                    message=format_anomaly_sms(t, anomaly["reason"], state.last_valid_fix),
+                    message=format_anomaly_sms(t, alert_reason, state.last_valid_fix),
+                    trigger_received_at=t.received_at,
                 )
                 state.last_alert_time = now
                 # The alert only had a stale (or no) position — send one
@@ -862,6 +1085,7 @@ class Gateway:
             self._alerts.submit(
                 node_id=t.node_id, reason="location_update", score=None, fix=t,
                 speed_kmph=t.speed_kmph, message=format_location_update_sms(t),
+                trigger_received_at=t.received_at,
             )
 
     # -----------------------------------------------------------------
@@ -874,6 +1098,10 @@ class Gateway:
             if state.contact_lost or silent_for < self._config.contact_timeout_seconds:
                 continue
             state.contact_lost = True
+            if not self._is_armed(state.node_id):
+                logger.info("Node %d: no contact for %s while DISARMED (owner may have driven out of "
+                            "range) — no alert.", state.node_id, _fmt_duration(silent_for))
+                continue
             logger.warning("Node %d: NO CONTACT for %s — raising loss-of-contact alert.",
                            state.node_id, _fmt_duration(silent_for))
             last = state.last_packet
@@ -898,6 +1126,9 @@ class Gateway:
             "lora_packets": self._radio.packets_received if self._radio else 0,
             "lora_crc_errors": self._radio.crc_errors if self._radio else 0,
             "loss_of_contact_alerts": self._config.loss_of_contact_alerts,
+            "encryption": ("AES-128-GCM required" if self._config.require_encryption else "AES-128-GCM")
+                          if self._config.lora_key else "off",
+            "rejected_packets": self._rejected_packets,
         })
 
     # -----------------------------------------------------------------
@@ -919,11 +1150,14 @@ class Gateway:
         self._alerts.start()
         self._write_status()
 
-        logger.info("Gateway running — %d alert number(s), loss-of-contact alerts %s (%.0f min). "
-                    "Listening for telemetry... (Ctrl+C to stop)",
+        logger.info("Gateway running — %d alert number(s), loss-of-contact alerts %s (%.0f min), "
+                    "LoRa encryption %s, new vehicles start %s. Listening for telemetry... (Ctrl+C to stop)",
                     len(self._config.alert_phone_numbers),
                     "ON" if self._config.loss_of_contact_alerts else "OFF",
-                    self._config.contact_timeout_seconds / 60.0)
+                    self._config.contact_timeout_seconds / 60.0,
+                    ("AES-128-GCM (unencrypted packets rejected)" if self._config.require_encryption
+                     else "AES-128-GCM (unencrypted packets also accepted)") if self._config.lora_key else "OFF",
+                    "ARMED" if self._config.default_armed else "disarmed")
 
         last_watchdog = last_radio_check = time.monotonic()
         while not self._stop_event.is_set():

@@ -109,6 +109,37 @@ The dashboard was then started against the resulting database: all six pages and
 
 ---
 
+## C. Final-version features — automated tests (19 October 2026)
+
+Encryption, arm/disarm, the two-colour route and the evaluation tool were added after the beta. The real gateway, firmware and dashboard code were tested as follows.
+
+| # | Test | Result |
+|---|---|---|
+| C1 | **Firmware → gateway encryption compatibility.** The ESP32 firmware source itself (`esp32_mobile_node.ino` with `aes_gcm_lite.h`) was compiled on a PC with stand-ins for the Arduino libraries. It built a 51-byte packet with a random key, and the gateway's `lora_crypto.py` decrypted and verified it. | PASS — header `(3, 2, 1001, 42, 1)`: boot epoch 41 → 42 on a simulated power-on; position, speed and flags decoded exactly |
+| C1b | **`aes_gcm_lite.h` correctness.** The firmware's own AES-128-GCM (written so the sketch doesn't depend on the ESP32 core's mbedtls headers, which were missing in the installed core: `mbedtls/gcm.h: No such file or directory`) was compared with Python's `cryptography` AESGCM on 500 random keys/nonces/data lengths (0–60 B additional data, 0–70 B plaintext), plus NIST SP 800-38D AES-128 test case 4. | PASS — 0 mismatches in 500; NIST tag `5bc94fbc…1a47` reproduced |
+| C2 | AES-128-GCM: altered header byte, altered ciphertext byte, altered tag byte, wrong key | PASS — all four rejected as authentication failures |
+| C3 | Replay of a previously accepted packet; forged packet; unencrypted v2 packet with `require_encryption` on | PASS — 3 rejected, counted on the System page; genuine packets still accepted |
+| C4 | Node power-cycle (new boot epoch) vs. a packet from an older epoch | PASS — new epoch accepted, older epoch rejected as a replay |
+| C5 | ARMED: heartbeat / motion | PASS — no alert / "Moved while ARMED" alert; armed motion not added to the learned baseline |
+| C6 | DISARMED: motion while the model is learning; silence beyond the contact timeout | PASS — no alert (logged as owner use); no CONTACT LOST SMS while disarmed, but sent once armed |
+| C7 | Database created by the beta version opened by the final version (twice) | PASS — new columns added, all rows kept |
+| C8 | Alert timing columns | PASS — trigger → alert → SMS-sent timestamps recorded for every alert |
+| C9 | Dashboard arm/disarm API | PASS — wrong PIN → HTTP 403; correct PIN → mode changed; 6th attempt after 5 wrong PINs → HTTP 429 lockout; disarming clears the vehicle's active alert |
+| C10 | Two-colour route API | PASS — points after a theft alert flagged `deviated` (red) until the disarm, others blue |
+| C11 | `eval_session.py` end to end (2 theft, 2 range, 1 normal, 1 shield session) | PASS — report showed 2/2 detected, 0/1 false alarms, PDR 100 % at 25 m and 83.3 % at 100 m (one packet deliberately dropped), CONTACT LOST 1/1 at 3.5 s, plus CSV files and charts |
+| C12 | Full simulation (`simulate.py --quick`), all seven scenarios | PASS — see below |
+
+**Simulation run (C12), alert sequence:** owner drive while disarmed → no alert (24 packets "driving judged normal", one isolated outlier not confirmed); theft while armed → `armed_motion` ×3 + `location_update`; out of range → `loss_of_contact`; attacks → 3 × `REJECTED`; unusual driving while disarmed → `isolation_forest`, confirmed on the 3rd outlier of 5. Route: 67 points, 33 red.
+
+**Two design faults found by these tests and fixed** (they would have produced false alarms in real use):
+
+| # | Fault | Root cause | Fix |
+|---|---|---|---|
+| C-F1 | The owner's ordinary drive raised an Isolation Forest alert. | The model was trained on all packets, so a few minutes of driving per day was "rare" next to thousands of parked heartbeats, and Isolation Forest scores rarity. | The model is now trained and applied **only on driving packets** recorded while disarmed. Whether the car should move at all is decided by arming. |
+| C-F2 | Even then, about 1 driving packet in 20 was scored an outlier. | `contamination = 0.05` labels 5 % of normal data as outliers by design; alerting on a single packet would cause a false alarm on most drives. | **3-of-5 confirmation rule**: an ML alert needs 3 outliers among the last 5 driving packets. Real abnormal driving is confirmed within seconds (scenario G: on the 5th packet). |
+
+---
+
 ## B. Hardware/field defects found and resolved
 
 | # | Scenario | Expected | Actual (defect) | Root cause | Resolution |
@@ -126,3 +157,60 @@ The dashboard was then started against the resulting database: all six pages and
 ## Summary
 
 Of the defects found (B1–B8), all were root-caused and resolved, not merely worked around. B1 in particular is worth highlighting for the demo: it wasn't a wiring or coding mistake, but a genuine hardware-identity mismatch between two pin-compatible chips with incompatible register maps for the exact feature (motion interrupt) the project depends on most — found through structured register-readback diagnostics rather than guesswork, and fixed with a general dual-silicon detection mechanism rather than a one-off patch.
+
+---
+
+## D. Isolation Forest benchmark (`ml_benchmark.py`, 22 October 2026)
+
+The gateway's own detector (features, window, 3-of-5 rule) was trained on 14 days of synthetic owner trips (2 per day, 15 min, one packet per 10 s) and tested on 50 held-out normal trips and 50 trips of each anomaly type. Two profiles: **vehicle** (0–70 km/h) and **walking** (the field-test emulation, 3–6 km/h). Same data for every variant; seed 2026. Run: `python ml_benchmark.py --csv results`.
+
+Trip-level results with the 3-of-5 rule (normal = false alarm rate per trip; others = detection rate):
+
+| Profile | Variant | Normal (FA) | Speed | Night | GPS jump | Erratic | Packet F1 |
+|---|---|---|---|---|---|---|---|
+| vehicle | beta (c = 0.05) | 44 % | 100 % | 96 % | 4 % | 100 % | 0.793 |
+| vehicle | tuned (c = 0.01) | 10 % | 48 % | 70 % | 0 % | 84 % | 0.402 |
+| vehicle | **final** (c = 0.01 + envelope) | **10 %** | **100 %** | 70 % | **100 %** | **100 %** | 0.712 |
+| walking | beta | 54 % | 100 % | 100 % | 10 % | 100 % | 0.868 |
+| walking | tuned | 6 % | 100 % | 84 % | 0 % | 100 % | 0.793 |
+| walking | **final** | **6 %** | **100 %** | 84 % | **100 %** | **100 %** | 0.825 |
+
+**Two further design faults found and fixed:**
+
+| # | Fault | Root cause | Fix |
+|---|---|---|---|
+| D-F1 | 44 % of normal trips raised a false alarm with the beta setting. | Consecutive packets are similar, so the 5 % outliers arrive in runs that satisfy 3-of-5. | Contamination lowered to 0.01. |
+| D-F2 | With c = 0.01, a 110–160 km/h getaway was detected only 48 % of the time; a 3 km GPS jump never. | Isolation Forest splits only inside the training range, so values far beyond it land in the same leaf as the training maximum; a jump is a single packet and can never collect 3 votes. | Learned speed envelope (1.25 × owner's max speed; implied speed 1.5 × that) that alerts immediately. Simulation scenario G now alerts on the first packet (`speed_envelope`). |
+
+Mean inference time: 6–9 ms per packet on the test PC (single packet through `NodeAnomalyDetector.evaluate`).
+
+---
+
+## E. Final field sessions (CUT stadium, 27 October 2026)
+
+Gateway running the beta detector (contamination 0.05, no envelope); contact timeout 16 min; SIM800C disconnected (registration denied on the only 2G network, Vodacom 65501). Source: `eval_session.py report` and the gateway database.
+
+| Measure | Result |
+|---|---|
+| Armed theft: first motion packet classified as theft | 4 / 4 |
+| Armed theft: alert raised | 3 / 4 (4th started 2 min after the 3rd: held back by the 5-min cooldown, by design) |
+| Packet received → alert raised (on the Pi) | mean 0.12 s, range 0.04–0.24 s |
+| Normal disarmed walk (11.5 min) | 1 false alarm; 33 of 76 judged packets scored as outliers (model trained on one 20-min walk; hour-of-day features out of range) |
+| Packet delivery ratio (66 min) | 98.9 % (656 / 663); 7 single-packet losses, all at RSSI ≤ −93 dBm |
+| Mean RSSI by distance | 0–25 m −59 dBm, 25–50 m −97, 50–100 m −101, 100–137 m −104 (max distance 137 m) |
+| Node powered off while armed | CONTACT LOST after 969 s (16-min timeout + watchdog); recovery 90 s after power-on |
+| Metal tin at a few metres | did not block the link (packets still received) |
+| SMS | 0 / 10 delivered (modem not registered); SMS delivery evidence from 9 October beta test (3 / 3) |
+
+### D2. Validation split (`ml_validate.py`, 31 October 2026)
+
+Settings were tuned on seed 1 only (grid: contamination 0.005/0.01/0.02/0.05 × envelope 1.1/1.25/1.5) and then tested on five unseen seeds (2–6), retraining on fresh owner data each time, 30 trips per type per seed. Mean ± SD over the five seeds:
+
+| Profile / variant | Normal (FA) | Speed | Night | Jump | Erratic |
+|---|---|---|---|---|---|
+| Vehicle / baseline (c 0.05, no envelope) | 50 ± 14 % | 95 ± 9 % | 97 ± 4 % | 6 ± 3 % | 100 % |
+| Vehicle / final (c 0.01, envelope 1.25) | 14 ± 7 % | 100 % | 79 ± 20 % | 100 % | 100 % |
+| Walking / baseline | 42 ± 14 % | 100 % | 99 ± 1 % | 13 ± 7 % | 100 % |
+| Walking / final | 12 ± 7 % | 100 % | 87 ± 11 % | 100 % | 100 % |
+
+The tuning seed alone selected c = 0.005, envelope 1.1 (false alarms 5–8 %, night detection 67–73 % on unseen seeds). Field proportions are reported with 95 % Wilson intervals (e.g. 4/4 detections → 51–100 %; PDR 656/663 → 97.8–99.5 %).

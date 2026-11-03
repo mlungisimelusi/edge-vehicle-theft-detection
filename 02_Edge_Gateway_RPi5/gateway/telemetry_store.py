@@ -56,7 +56,9 @@ CREATE TABLE IF NOT EXISTS telemetry (
     snr_db              REAL NOT NULL,
     anomaly_score       REAL,
     is_anomaly          INTEGER NOT NULL DEFAULT 0,
-    received_at         REAL NOT NULL
+    received_at         REAL NOT NULL,
+    boot_epoch          INTEGER,
+    protocol_version    INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_telemetry_node_time ON telemetry(node_id, received_at);
 
@@ -69,7 +71,9 @@ CREATE TABLE IF NOT EXISTS alerts (
     longitude    REAL NOT NULL,
     speed_kmph   REAL NOT NULL,
     sms_sent     INTEGER NOT NULL DEFAULT 0,
-    sent_at      REAL NOT NULL
+    sent_at      REAL NOT NULL,
+    trigger_received_at REAL,
+    sms_sent_at  REAL
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_node_time ON alerts(node_id, sent_at);
 
@@ -86,9 +90,51 @@ CREATE TABLE IF NOT EXISTS gateway_status (
     pending_alerts          INTEGER NOT NULL,
     lora_packets            INTEGER NOT NULL,
     lora_crc_errors         INTEGER NOT NULL,
-    loss_of_contact_alerts  INTEGER NOT NULL
+    loss_of_contact_alerts  INTEGER NOT NULL,
+    encryption              TEXT,
+    rejected_packets        INTEGER
+);
+
+-- Arm/disarm state per vehicle, written by the dashboard and read by the
+-- gateway. ARMED = parked / owner away: any motion is a theft alert.
+-- DISARMED = owner using the vehicle: only the Isolation Forest can alert,
+-- and the owner's driving is what the model learns as "normal".
+CREATE TABLE IF NOT EXISTS vehicle_mode (
+    node_id     INTEGER PRIMARY KEY,
+    armed       INTEGER NOT NULL,
+    changed_at  REAL NOT NULL,
+    changed_by  TEXT
+);
+CREATE TABLE IF NOT EXISTS vehicle_mode_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id     INTEGER NOT NULL,
+    armed       INTEGER NOT NULL,
+    changed_at  REAL NOT NULL,
+    changed_by  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mode_events_node_time ON vehicle_mode_events(node_id, changed_at);
+
+-- Labelled test sessions for the evaluation (eval_session.py): each row is
+-- one theft / normal-use / range / shield test with its time window.
+CREATE TABLE IF NOT EXISTS evaluation_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    label        TEXT NOT NULL,
+    started_at   REAL NOT NULL,
+    ended_at     REAL,
+    distance_m   REAL,
+    armed        INTEGER,
+    phone_sms_at REAL,
+    note         TEXT
 );
 """
+
+# Columns added after the first release. _ensure_columns() adds any that an
+# existing database is missing, so old databases keep working.
+_ADDED_COLUMNS = {
+    "telemetry": {"boot_epoch": "INTEGER", "protocol_version": "INTEGER"},
+    "alerts": {"trigger_received_at": "REAL", "sms_sent_at": "REAL"},
+    "gateway_status": {"encryption": "TEXT", "rejected_packets": "INTEGER"},
+}
 
 
 @contextmanager
@@ -187,10 +233,27 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.isolation_level = ""
 
 
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in _ADDED_COLUMNS.items():
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, sql_type in columns.items():
+            if name in existing:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+            except sqlite3.OperationalError as exc:
+                # The gateway and dashboard may both be starting up; if the
+                # other process added the column first, that's fine.
+                if "duplicate column" not in str(exc).lower():
+                    raise
+    conn.commit()
+
+
 def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
     with _connect(db_path) as conn:
         conn.executescript(_SCHEMA)
         _migrate(conn)
+        _ensure_columns(conn)
 
 
 def insert_telemetry(record: dict, db_path: str = DEFAULT_DB_PATH) -> int:
@@ -203,11 +266,12 @@ def insert_telemetry(record: dict, db_path: str = DEFAULT_DB_PATH) -> int:
             """INSERT INTO telemetry
                (node_id, latitude, longitude, speed_kmph, heading_deg, satellites,
                 motion_flag, gps_valid, battery_millivolts, sequence_number, packet_type,
-                rssi_dbm, snr_db, anomaly_score, is_anomaly, received_at)
+                rssi_dbm, snr_db, anomaly_score, is_anomaly, received_at, boot_epoch,
+                protocol_version)
                VALUES (:node_id, :latitude, :longitude, :speed_kmph, :heading_deg,
                        :satellites, :motion_flag, :gps_valid, :battery_millivolts,
                        :sequence_number, :packet_type, :rssi_dbm, :snr_db, :anomaly_score,
-                       :is_anomaly, :received_at)""",
+                       :is_anomaly, :received_at, :boot_epoch, :protocol_version)""",
             {
                 "node_id": record["node_id"],
                 "latitude": record["latitude"],
@@ -225,6 +289,8 @@ def insert_telemetry(record: dict, db_path: str = DEFAULT_DB_PATH) -> int:
                 "anomaly_score": record.get("anomaly_score"),
                 "is_anomaly": int(bool(record.get("is_anomaly", False))),
                 "received_at": record.get("received_at", time.time()),
+                "boot_epoch": record.get("boot_epoch"),
+                "protocol_version": record.get("protocol_version"),
             },
         )
         return cur.lastrowid
@@ -236,8 +302,10 @@ def insert_alert(record: dict, db_path: str = DEFAULT_DB_PATH) -> int:
     with _connect(db_path) as conn:
         cur = conn.execute(
             """INSERT INTO alerts
-               (node_id, reason, score, latitude, longitude, speed_kmph, sms_sent, sent_at)
-               VALUES (:node_id, :reason, :score, :latitude, :longitude, :speed_kmph, :sms_sent, :sent_at)""",
+               (node_id, reason, score, latitude, longitude, speed_kmph, sms_sent, sent_at,
+                trigger_received_at)
+               VALUES (:node_id, :reason, :score, :latitude, :longitude, :speed_kmph, :sms_sent,
+                       :sent_at, :trigger_received_at)""",
             {
                 "node_id": record["node_id"],
                 "reason": record["reason"],
@@ -247,6 +315,7 @@ def insert_alert(record: dict, db_path: str = DEFAULT_DB_PATH) -> int:
                 "speed_kmph": record["speed_kmph"],
                 "sms_sent": int(bool(record.get("sms_sent", False))),
                 "sent_at": record.get("sent_at", time.time()),
+                "trigger_received_at": record.get("trigger_received_at"),
             },
         )
         return cur.lastrowid
@@ -257,7 +326,8 @@ def mark_alert_sms_sent(alert_id: int, db_path: str = DEFAULT_DB_PATH) -> None:
     delivered to the module (the alert row is written the moment the alert
     is raised, so it is never lost even if the SMS takes minutes to go out)."""
     with _connect(db_path) as conn:
-        conn.execute("UPDATE alerts SET sms_sent = 1 WHERE id = ?", (alert_id,))
+        conn.execute("UPDATE alerts SET sms_sent = 1, sms_sent_at = COALESCE(sms_sent_at, ?) WHERE id = ?",
+                     (time.time(), alert_id))
 
 
 def write_gateway_status(status: dict, db_path: str = DEFAULT_DB_PATH) -> None:
@@ -266,16 +336,19 @@ def write_gateway_status(status: dict, db_path: str = DEFAULT_DB_PATH) -> None:
         conn.execute(
             """INSERT INTO gateway_status
                (id, started_at, updated_at, gsm_ready, gsm_port, alert_numbers, pending_alerts,
-                lora_packets, lora_crc_errors, loss_of_contact_alerts)
+                lora_packets, lora_crc_errors, loss_of_contact_alerts, encryption, rejected_packets)
                VALUES (1, :started_at, :updated_at, :gsm_ready, :gsm_port, :alert_numbers,
-                       :pending_alerts, :lora_packets, :lora_crc_errors, :loss_of_contact_alerts)
+                       :pending_alerts, :lora_packets, :lora_crc_errors, :loss_of_contact_alerts,
+                       :encryption, :rejected_packets)
                ON CONFLICT(id) DO UPDATE SET
                  started_at=excluded.started_at, updated_at=excluded.updated_at,
                  gsm_ready=excluded.gsm_ready, gsm_port=excluded.gsm_port,
                  alert_numbers=excluded.alert_numbers, pending_alerts=excluded.pending_alerts,
                  lora_packets=excluded.lora_packets, lora_crc_errors=excluded.lora_crc_errors,
-                 loss_of_contact_alerts=excluded.loss_of_contact_alerts""",
-            {**status, "gsm_ready": int(bool(status["gsm_ready"])),
+                 loss_of_contact_alerts=excluded.loss_of_contact_alerts,
+                 encryption=excluded.encryption, rejected_packets=excluded.rejected_packets""",
+            {"encryption": None, "rejected_packets": 0, **status,
+             "gsm_ready": int(bool(status["gsm_ready"])),
              "loss_of_contact_alerts": int(bool(status["loss_of_contact_alerts"]))},
         )
 
@@ -332,6 +405,117 @@ def get_recent_telemetry_per_node(limit_per_node: int, db_path: str = DEFAULT_DB
                ) WHERE rn <= ? ORDER BY id ASC""",
             (limit_per_node,),
         ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Arm / disarm
+# ---------------------------------------------------------------------------
+def get_vehicle_armed(node_id: int, default: bool = True, db_path: str = DEFAULT_DB_PATH) -> bool:
+    with _connect(db_path) as conn:
+        row = conn.execute("SELECT armed FROM vehicle_mode WHERE node_id = ?", (node_id,)).fetchone()
+        return bool(row["armed"]) if row is not None else default
+
+
+def get_vehicle_modes(db_path: str = DEFAULT_DB_PATH) -> dict:
+    """{node_id: {"armed": bool, "changed_at": float}} for every vehicle with a stored mode."""
+    with _connect(db_path) as conn:
+        return {r["node_id"]: {"armed": bool(r["armed"]), "changed_at": r["changed_at"]}
+                for r in conn.execute("SELECT * FROM vehicle_mode").fetchall()}
+
+
+def set_vehicle_armed(node_id: int, armed: bool, changed_by: str = "dashboard",
+                      db_path: str = DEFAULT_DB_PATH) -> float:
+    now = time.time()
+    with _connect(db_path) as conn:
+        conn.execute(
+            """INSERT INTO vehicle_mode (node_id, armed, changed_at, changed_by) VALUES (?, ?, ?, ?)
+               ON CONFLICT(node_id) DO UPDATE SET armed=excluded.armed,
+                 changed_at=excluded.changed_at, changed_by=excluded.changed_by""",
+            (node_id, int(bool(armed)), now, changed_by))
+        conn.execute("INSERT INTO vehicle_mode_events (node_id, armed, changed_at, changed_by) "
+                     "VALUES (?, ?, ?, ?)", (node_id, int(bool(armed)), now, changed_by))
+    return now
+
+
+def get_mode_events(node_id: int, since_epoch: float = 0.0, db_path: str = DEFAULT_DB_PATH) -> List[sqlite3.Row]:
+    with _connect(db_path) as conn:
+        return conn.execute(
+            "SELECT * FROM vehicle_mode_events WHERE node_id = ? AND changed_at >= ? ORDER BY changed_at",
+            (node_id, since_epoch)).fetchall()
+
+
+def get_last_disarm_time(node_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[float]:
+    with _connect(db_path) as conn:
+        row = conn.execute("SELECT MAX(changed_at) AS t FROM vehicle_mode_events "
+                           "WHERE node_id = ? AND armed = 0", (node_id,)).fetchone()
+        return row["t"] if row else None
+
+
+def get_theft_alerts_since(node_id: int, since_epoch: float, db_path: str = DEFAULT_DB_PATH) -> List[sqlite3.Row]:
+    """Theft alerts only (not location updates or loss-of-contact), oldest first."""
+    with _connect(db_path) as conn:
+        return conn.execute(
+            """SELECT id, reason, sent_at FROM alerts WHERE node_id = ? AND sent_at >= ?
+               AND reason NOT IN ('location_update', 'loss_of_contact') ORDER BY sent_at""",
+            (node_id, since_epoch)).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Evaluation sessions (eval_session.py)
+# ---------------------------------------------------------------------------
+def start_evaluation_event(label: str, distance_m: Optional[float], armed: Optional[bool], note: Optional[str],
+                           db_path: str = DEFAULT_DB_PATH) -> int:
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO evaluation_events (label, started_at, distance_m, armed, note) VALUES (?, ?, ?, ?, ?)",
+            (label, time.time(), distance_m, None if armed is None else int(bool(armed)), note))
+        return cur.lastrowid
+
+
+def get_open_evaluation_event(db_path: str = DEFAULT_DB_PATH) -> Optional[sqlite3.Row]:
+    with _connect(db_path) as conn:
+        return conn.execute("SELECT * FROM evaluation_events WHERE ended_at IS NULL "
+                            "ORDER BY id DESC LIMIT 1").fetchone()
+
+
+def end_evaluation_event(event_id: int, db_path: str = DEFAULT_DB_PATH) -> None:
+    with _connect(db_path) as conn:
+        conn.execute("UPDATE evaluation_events SET ended_at = ? WHERE id = ?", (time.time(), event_id))
+
+
+def set_evaluation_phone_time(event_id: int, phone_sms_at: float, db_path: str = DEFAULT_DB_PATH) -> None:
+    with _connect(db_path) as conn:
+        conn.execute("UPDATE evaluation_events SET phone_sms_at = ? WHERE id = ?", (phone_sms_at, event_id))
+
+
+def get_evaluation_events(db_path: str = DEFAULT_DB_PATH) -> List[sqlite3.Row]:
+    with _connect(db_path) as conn:
+        return conn.execute("SELECT * FROM evaluation_events ORDER BY started_at").fetchall()
+
+
+def get_alerts_between(start: float, end: float, node_id: Optional[int] = None,
+                       db_path: str = DEFAULT_DB_PATH) -> List[sqlite3.Row]:
+    with _connect(db_path) as conn:
+        if node_id is None:
+            return conn.execute("SELECT * FROM alerts WHERE sent_at BETWEEN ? AND ? ORDER BY sent_at",
+                                (start, end)).fetchall()
+        return conn.execute("SELECT * FROM alerts WHERE node_id = ? AND sent_at BETWEEN ? AND ? "
+                            "ORDER BY sent_at", (node_id, start, end)).fetchall()
+
+
+def get_telemetry_between(start: float, end: float, node_id: Optional[int] = None,
+                          db_path: str = DEFAULT_DB_PATH) -> List[sqlite3.Row]:
+    with _connect(db_path) as conn:
+        if node_id is None:
+            return conn.execute("SELECT * FROM telemetry WHERE received_at BETWEEN ? AND ? "
+                                "ORDER BY received_at", (start, end)).fetchall()
+        return conn.execute("SELECT * FROM telemetry WHERE node_id = ? AND received_at BETWEEN ? AND ? "
+                            "ORDER BY received_at", (node_id, start, end)).fetchall()
+
+
+def get_all_alerts(db_path: str = DEFAULT_DB_PATH) -> List[sqlite3.Row]:
+    with _connect(db_path) as conn:
+        return conn.execute("SELECT * FROM alerts ORDER BY sent_at").fetchall()
 
 
 # ---------------------------------------------------------------------------

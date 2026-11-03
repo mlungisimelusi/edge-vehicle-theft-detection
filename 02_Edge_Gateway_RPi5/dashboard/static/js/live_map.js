@@ -59,7 +59,8 @@ function ensureMarker(nodeId, entry, latlng) {
   entry.marker = L.marker(latlng, { icon: buildVehicleIcon(entry.lastRow) }).addTo(map);
   entry.marker.on('click', () => selectNode(nodeId));
   entry.marker.bindTooltip(tooltipText(nodeId, entry.lastRow), { direction: 'top', offset: [0, -14] });
-  entry.trail = L.polyline(entry.trailPoints, { color: '#3b82f6', weight: 3, opacity: 0.5 }).addTo(map);
+  entry.trail = L.layerGroup().addTo(map);
+  window.Dashboard.drawRoute(entry.trail, entry.trailPoints);
 }
 
 function refreshMarker(nodeId, entry) {
@@ -69,15 +70,17 @@ function refreshMarker(nodeId, entry) {
 }
 
 // Pre-fill the trail with the last couple of hours, so opening the page
-// shows where the vehicle has been, not just a single dot.
+// shows where the vehicle has been, not just a single dot. The server marks
+// each point as normal (blue) or recorded after a theft alert (red).
 async function loadTrail(nodeId, entry) {
   entry.trailRequested = true;
   try {
-    const resp = await fetch(`/api/history?node_id=${nodeId}&hours=${TRAIL_HISTORY_HOURS}`);
+    const resp = await fetch(`/api/route?node_id=${nodeId}&hours=${TRAIL_HISTORY_HOURS}`);
     if (!resp.ok) return;
-    const history = (await resp.json()).filter(r => r.gps_valid).map(r => [r.latitude, r.longitude]);
-    entry.trailPoints = history.concat(entry.trailPoints).slice(-MAX_LIVE_TRAIL_POINTS);
-    if (entry.trail) entry.trail.setLatLngs(entry.trailPoints);
+    const history = await resp.json();
+    const lastT = history.length ? history[history.length - 1].t : 0;
+    entry.trailPoints = history.concat(entry.trailPoints.filter(p => p.t > lastT)).slice(-MAX_LIVE_TRAIL_POINTS);
+    if (entry.trail) window.Dashboard.drawRoute(entry.trail, entry.trailPoints);
   } catch (err) {
     console.warn('Could not load trail for vehicle', nodeId, err);
   }
@@ -115,9 +118,10 @@ function upsertNodeData(nodeId, row) {
     refreshMarker(nodeId, entry);
 
     if (row.gps_valid && moved) {
-      entry.trailPoints.push(latlng);
+      entry.trailPoints.push({ lat: latlng[0], lon: latlng[1], t: row.received_at,
+                               deviated: window.Dashboard.isTheftActive(row) });
       if (entry.trailPoints.length > MAX_LIVE_TRAIL_POINTS) entry.trailPoints.shift();
-      entry.trail.setLatLngs(entry.trailPoints);
+      window.Dashboard.drawRoute(entry.trail, entry.trailPoints);
     }
     entry.lastValidLatLng = latlng;
 
@@ -151,6 +155,7 @@ function renderVehicleList() {
     card.innerHTML = `
       <div class="mvc-row"><span class="status-dot ${state.cls}"></span>Vehicle ${nodeId}
         <span class="badge ${state.cls}" style="margin-left:auto;">${state.label}</span></div>
+      <div class="mvc-meta">${row.armed === undefined ? '' : window.Dashboard.modeBadge(row.armed)}</div>
       <div class="mvc-meta">${row.gps_valid ? row.speed_kmph.toFixed(0) + ' km/h &middot; ' : ''}<span data-ts="${row.received_at}">${window.Dashboard.relativeTime(row.received_at)}</span>${where}</div>
       <div class="mvc-meta"><a href="/fleet/${nodeId}" style="color:var(--accent-2)" onclick="event.stopPropagation()">view details &rarr;</a></div>
     `;
@@ -177,6 +182,15 @@ window.Dashboard.on('alert', (alert) => {
   if (!entry || !window.Dashboard.isThreat(alert)) return;
   entry.lastRow = window.Dashboard.applyAlertToRow(entry.lastRow, alert);
   refreshMarker(alert.node_id, entry);
+  renderVehicleList();
+});
+// Arm/disarm from any browser. Disarming acknowledges a theft alert.
+window.Dashboard.on('mode', (m) => {
+  const entry = nodes[m.node_id];
+  if (!entry) return;
+  entry.lastRow = { ...entry.lastRow, armed: m.armed };
+  if (!m.armed) entry.lastRow.active_alert = null;
+  refreshMarker(m.node_id, entry);
   renderVehicleList();
 });
 // Time-based state (no signal, gps lost, alert expiry) needs re-evaluating

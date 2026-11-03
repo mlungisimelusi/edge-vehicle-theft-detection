@@ -9,6 +9,7 @@
 //   telemetry     a new packet (row enriched with last_valid_fix/active_alert)
 //   alert         a new alert row
 //   alert_update  an existing alert changed (its SMS was confirmed sent)
+//   mode          a vehicle was armed or disarmed (from any browser)
 //   tick          every 15 s, so pages re-evaluate time-based state (a
 //                 vehicle that stops reporting must turn "no signal" even
 //                 though no new message arrives to trigger a re-render)
@@ -82,8 +83,10 @@ window.Dashboard = (function () {
 
   // Human-readable labels for the gateway's alert reason codes.
   const REASON_LABELS = {
+    armed_motion: 'Moved while ARMED',
     coldstart_hardware_motion_flag: 'Motion detected (learning period)',
     isolation_forest: 'Unusual movement pattern (Isolation Forest)',
+    speed_envelope: "Faster than the owner's learned speed range",
     isolation_forest_context: 'Motion at an unusual time (Isolation Forest)',
     loss_of_contact: 'Contact lost — out of range or jammed?',
     location_update: 'Location update (follow-up)',
@@ -108,6 +111,69 @@ window.Dashboard = (function () {
 
   function hasFix(alert) {
     return !(alert.latitude === 0 && alert.longitude === 0);
+  }
+
+  // ---- Arm / disarm ----------------------------------------------------
+  function modeBadge(armed) {
+    return armed
+      ? '<span class="badge danger" title="Any motion raises a theft alert">ARMED</span>'
+      : '<span class="badge muted" title="Owner in use: only the Isolation Forest can alert">DISARMED</span>';
+  }
+
+  // Arms or disarms a vehicle; asks for the dashboard PIN when one is set.
+  // Returns the new state, or null if cancelled / refused.
+  async function setMode(nodeId, armed) {
+    const info = await fetch(`/api/vehicles/${nodeId}/mode`).then(r => r.json()).catch(() => ({}));
+    let pin = null;
+    if (info.pin_required) {
+      pin = window.prompt(`Enter the dashboard PIN to ${armed ? 'ARM' : 'DISARM'} vehicle ${nodeId}:`);
+      if (pin === null) return null;
+    }
+    const resp = await fetch(`/api/vehicles/${nodeId}/mode`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ armed, pin }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      window.alert(err.detail || `Could not change the mode (HTTP ${resp.status}).`);
+      return null;
+    }
+    return (await resp.json()).armed;
+  }
+
+  // ---- Two-colour route -------------------------------------------------
+  // Blue = normal route; red = route recorded after a theft alert, until the
+  // owner disarmed or the alert expired. Points: [{lat, lon, deviated}].
+  const ROUTE_NORMAL = '#3b82f6';
+  const ROUTE_DEVIATED = '#ef4444';
+
+  function drawRoute(layerGroup, points) {
+    layerGroup.clearLayers();
+    let segment = [], colour = null, previous = null;
+    const flush = () => {
+      if (segment.length > 1) {
+        L.polyline(segment, { color: colour, weight: 4, opacity: colour === ROUTE_DEVIATED ? 0.9 : 0.6 })
+          .addTo(layerGroup);
+      }
+    };
+    points.forEach(p => {
+      const c = p.deviated ? ROUTE_DEVIATED : ROUTE_NORMAL;
+      const ll = [p.lat, p.lon];
+      if (c !== colour) {
+        flush();
+        segment = previous ? [previous] : [];   // keep the line continuous
+        colour = c;
+      }
+      segment.push(ll);
+      previous = ll;
+    });
+    flush();
+  }
+
+  // Is this vehicle currently in a theft situation (for colouring live points)?
+  function isTheftActive(row) {
+    const a = row.active_alert;
+    return !!(a && a.reason !== 'loss_of_contact' && (Date.now() / 1000) - a.sent_at < ALERT_ACTIVE_SECONDS);
   }
 
   function escapeHtml(value) {
@@ -200,6 +266,7 @@ window.Dashboard = (function () {
   return {
     on, relativeTime, durationFromSeconds, volts, vehicleState, applyAlertToRow,
     reasonLabel, smsLabel, isThreat, hasFix, escapeHtml, addBaseMaps,
+    modeBadge, setMode, drawRoute, isTheftActive, ROUTE_NORMAL, ROUTE_DEVIATED,
   };
 })();
 

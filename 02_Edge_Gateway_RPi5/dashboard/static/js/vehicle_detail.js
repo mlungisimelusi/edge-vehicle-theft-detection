@@ -10,11 +10,30 @@ const DEFAULT_CENTER = [-29.1211, 26.2140];   // Bloemfontein, until a fix is kn
 
 const map = L.map('vd-map', { zoomControl: true }).setView(DEFAULT_CENTER, 13);
 window.Dashboard.addBaseMaps(map);
-routeLine = L.polyline([], { color: '#3b82f6', weight: 3, opacity: 0.6 }).addTo(map);
+routeLine = L.layerGroup().addTo(map);     // two-colour route, see Dashboard.drawRoute
+let routePoints = [];
+let currentArmed = null;
 
 function isThisVehicle(nodeId) {
   return String(nodeId) === String(NODE_ID);
 }
+
+function renderMode(armed) {
+  currentArmed = armed;
+  document.getElementById('vd-mode-badge').innerHTML = window.Dashboard.modeBadge(armed);
+  const btn = document.getElementById('vd-mode-btn');
+  btn.style.display = 'inline-block';
+  btn.textContent = armed ? 'Disarm (I am using the vehicle)' : 'Arm (vehicle parked)';
+}
+
+document.getElementById('vd-mode-btn').addEventListener('click', async () => {
+  if (currentArmed === null) return;
+  const result = await window.Dashboard.setMode(NODE_ID, !currentArmed);
+  if (result === null) return;
+  renderMode(result);
+  if (!result && currentRow) { currentRow = { ...currentRow, active_alert: null }; renderState(); }
+  loadHistory();
+});
 
 function renderState() {
   if (!currentRow) return;
@@ -32,6 +51,7 @@ function applyRow(row) {
   currentRow = row;
   document.getElementById('vd-nodata').style.display = 'none';
   renderState();
+  if (row.armed !== undefined) renderMode(row.armed);
 
   // Speed/heading only mean something with a fresh fix in THIS packet.
   document.getElementById('vd-speed').textContent = row.gps_valid ? `${row.speed_kmph.toFixed(1)} km/h` : '—';
@@ -153,9 +173,13 @@ async function loadHistory() {
   batteryChart.data.datasets[0].data = withBattery.map(r => r.battery_millivolts / 1000);
   batteryChart.update();
 
-  routeLine.setLatLngs(withFix.map(r => [r.latitude, r.longitude]));
-  document.getElementById('vd-route-note').textContent = withFix.length
-    ? `Route over the selected window: ${withFix.length} GPS fixes.`
+  const routeResp = await fetch(`/api/route?node_id=${NODE_ID}&hours=${historyHours}`);
+  routePoints = routeResp.ok ? await routeResp.json() : [];
+  window.Dashboard.drawRoute(routeLine, routePoints);
+  const deviated = routePoints.filter(p => p.deviated).length;
+  document.getElementById('vd-route-note').textContent = routePoints.length
+    ? `Route over the selected window: ${routePoints.length} GPS fixes` +
+      (deviated ? `, ${deviated} of them after a theft alert.` : '.')
     : 'No GPS fixes in the selected window.';
 }
 
@@ -184,7 +208,9 @@ window.Dashboard.on('telemetry', (row) => {
   const label = timeLabel(row.received_at);
   if (row.gps_valid) {
     pushPoint(speedChart, label, row.speed_kmph);
-    routeLine.addLatLng([row.latitude, row.longitude]);
+    routePoints.push({ lat: row.latitude, lon: row.longitude, t: row.received_at,
+                       deviated: window.Dashboard.isTheftActive(row) });
+    window.Dashboard.drawRoute(routeLine, routePoints);
   }
   if (row.battery_millivolts > 0) pushPoint(batteryChart, label, row.battery_millivolts / 1000);
   speedChart.update();
@@ -199,11 +225,20 @@ window.Dashboard.on('alert', (alert) => {
 window.Dashboard.on('alert_update', (alert) => {
   if (isThisVehicle(alert.node_id)) loadAlerts();
 });
+window.Dashboard.on('mode', (m) => {
+  if (String(m.node_id) !== String(NODE_ID)) return;
+  renderMode(m.armed);
+  if (!m.armed && currentRow) { currentRow = { ...currentRow, active_alert: null }; renderState(); }
+});
 window.Dashboard.on('tick', renderState);
 
 initCharts();
 loadHistory();
 loadAlerts();
+
+fetch(`/api/vehicles/${NODE_ID}/mode`).then(r => r.ok ? r.json() : null).then(m => {
+  if (m) renderMode(m.armed);
+});
 
 fetch(`/api/latest?node_id=${NODE_ID}`).then(r => r.ok ? r.json() : []).then(rowsData => {
   if (rowsData.length) applyRow(rowsData[0]);

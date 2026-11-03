@@ -32,7 +32,12 @@
     </div>
   </div>
 
-  <div class="grid grid-cols-4" style="margin-bottom:16px;">
+  <div class="grid grid-cols-4" style="margin-bottom:16px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
+    <div class="card stat-card">
+      <div class="label">LoRa link security</div>
+      <div class="value" id="sys-crypto"><span class="status-dot muted"></span></div>
+      <div class="sub" id="sys-crypto-sub">—</div>
+    </div>
     <div class="card stat-card">
       <div class="label">LoRa link</div>
       <div class="value" id="sys-lora-status"><span class="status-dot muted"></span></div>
