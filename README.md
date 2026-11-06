@@ -36,6 +36,24 @@ Before the scenarios, the simulation generates a week of normal history (parked 
 
 ---
 
+## Gallery
+
+| | |
+|---|---|
+| ![Three-tier architecture](docs/images/architecture.png) | ![Live dashboard during the field test](docs/images/dashboard_live_map.png) |
+| **Three-tier architecture** — node, edge gateway, owner/dashboard | **Live dashboard** — route recorded around the CUT stadium |
+
+![Assembled prototype](docs/images/prototype_hardware.png)
+*The assembled prototype: (a) mobile node — ESP32, SX1278, MPU-6500, Neo-6M; (b) edge gateway — Raspberry Pi 5, SX1278 receiver, SIM800C with bulk capacitor and GSM antenna.*
+
+| | |
+|---|---|
+| ![Decision logic](docs/images/decision_logic.png) | ![Benchmark](docs/images/ml_benchmark.png) |
+| **Decision logic** for every received packet | **Detector benchmark** — baseline vs tuned vs final (`ml_benchmark.py`) |
+
+![RSSI vs distance](docs/images/field_rssi_vs_distance.png)
+*Field test, 27 October 2026: RSSI of every received packet against distance from the gateway (98.9 % packet delivery).*
+
 ## 1. System overview
 
 ```
